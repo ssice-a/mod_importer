@@ -101,6 +101,8 @@ class DetectedSlice:
     index_count: int
     used_vertex_start: int
     used_vertex_end: int
+    producer_start_vertex: int | None
+    producer_vertex_count: int | None
     vb1_layout_path: str | None
     section_selector: int | None
     producer_dispatch_index: int | None
@@ -109,6 +111,8 @@ class DetectedSlice:
     last_cs_hash: str | None
     last_cs_cb0_hash: str | None
     last_consumer_draw_index: int | None
+    depth_vs_hashes: tuple[str, ...]
+    gbuffer_vs_hashes: tuple[str, ...]
     section_transform: SectionTransform | None
 
 

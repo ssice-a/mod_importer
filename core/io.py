@@ -13,6 +13,18 @@ from .models import CompactedGeometry, IndexSlice, PackedHalf2x4, Snorm4
 _INDEX_LINE_RE = re.compile(r"^\s*(\d+)\s+(\d+)\s+(\d+)\s*$")
 
 
+def _write_bytes_if_changed(path: str, data: bytes) -> str:
+    output_path = Path(path)
+    if output_path.is_file() and output_path.stat().st_size == len(data):
+        try:
+            if output_path.read_bytes() == data:
+                return path
+        except OSError:
+            pass
+    output_path.write_bytes(data)
+    return path
+
+
 def read_index_slice_txt(path: str) -> IndexSlice:
     """Parse a 3DMigoto index dump text file for a single draw slice."""
     first_index = None
@@ -237,6 +249,16 @@ def read_u32_buffer(path: str) -> list[int]:
     return [value[0] for value in struct.iter_unpack("<I", data)]
 
 
+def read_u16_buffer(path: str) -> list[int]:
+    """Read a raw buffer as little-endian uint16 values."""
+    data = Path(path).read_bytes()
+    if len(data) == 0:
+        raise ValueError(f"Buffer is empty: {path}")
+    if len(data) % 2 != 0:
+        raise ValueError(f"Buffer size is not a multiple of 2 bytes: {path}")
+    return [value[0] for value in struct.iter_unpack("<H", data)]
+
+
 def build_compacted_geometry(
     positions: list[tuple[float, float, float]],
     triangles: list[tuple[int, int, int]],
@@ -292,8 +314,7 @@ def write_u16_buffer(path: str, values: list[int]) -> str:
         if value < 0 or value > 0xFFFF:
             raise ValueError(f"Index value outside R16_UINT range: {value}")
         data.extend(struct.pack("<H", value))
-    Path(path).write_bytes(bytes(data))
-    return path
+    return _write_bytes_if_changed(path, bytes(data))
 
 
 def write_float3_buffer(path: str, values: list[tuple[float, float, float]]) -> str:
@@ -301,8 +322,15 @@ def write_float3_buffer(path: str, values: list[tuple[float, float, float]]) -> 
     data = bytearray()
     for x_value, y_value, z_value in values:
         data.extend(struct.pack("<3f", float(x_value), float(y_value), float(z_value)))
-    Path(path).write_bytes(bytes(data))
-    return path
+    return _write_bytes_if_changed(path, bytes(data))
+
+
+def write_f32_buffer(path: str, values: list[float]) -> str:
+    """Write a little-endian float32 buffer."""
+    data = bytearray()
+    for value in values:
+        data.extend(struct.pack("<f", float(value)))
+    return _write_bytes_if_changed(path, bytes(data))
 
 
 def write_weight_pairs_buffer(
@@ -318,8 +346,7 @@ def write_weight_pairs_buffer(
     for index_record, weight_record in zip(indices, weights):
         data.extend(struct.pack("<4B", *[int(value) & 0xFF for value in index_record]))
         data.extend(struct.pack("<4B", *[int(value) & 0xFF for value in weight_record]))
-    Path(path).write_bytes(bytes(data))
-    return path
+    return _write_bytes_if_changed(path, bytes(data))
 
 
 def write_half2x4_buffer(path: str, records: list[PackedHalf2x4]) -> str:
@@ -330,8 +357,7 @@ def write_half2x4_buffer(path: str, records: list[PackedHalf2x4]) -> str:
         if len(flat_values) != 8:
             raise ValueError("Expected exactly 8 half values per packed UV record.")
         data.extend(struct.pack("<8e", *flat_values))
-    Path(path).write_bytes(bytes(data))
-    return path
+    return _write_bytes_if_changed(path, bytes(data))
 
 
 def write_snorm8x4_pairs_buffer(path: str, frame_a: list[Snorm4], frame_b: list[Snorm4]) -> str:
@@ -343,8 +369,7 @@ def write_snorm8x4_pairs_buffer(path: str, frame_a: list[Snorm4], frame_b: list[
     for record_a, record_b in zip(frame_a, frame_b):
         for record in (record_a, record_b):
             data.extend(bytes(_float_to_snorm8(value) for value in record))
-    Path(path).write_bytes(bytes(data))
-    return path
+    return _write_bytes_if_changed(path, bytes(data))
 
 
 def write_u32_buffer(path: str, values: list[int]) -> str:
@@ -352,8 +377,7 @@ def write_u32_buffer(path: str, values: list[int]) -> str:
     data = bytearray()
     for value in values:
         data.extend(struct.pack("<I", int(value) & 0xFFFFFFFF))
-    Path(path).write_bytes(bytes(data))
-    return path
+    return _write_bytes_if_changed(path, bytes(data))
 
 
 def write_json(path: str, payload: object) -> str:

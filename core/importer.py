@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,10 +15,22 @@ from .io import (
     read_index_slice_txt,
     read_post_cs_frame_pairs,
     read_pre_cs_frame_pairs,
+    read_u16_buffer,
     read_vb0_positions,
     read_weight_pairs,
 )
 from .models import DetectedModelBundle, PackedHalf2x4, ResolvedImportBundle, SectionTransform
+from .profiles import YIHUAN_PROFILE
+
+
+_PART_COMMENT_RE = re.compile(r"^;\s*\[part:(?P<part>[^\]]+)\]")
+_STAGE_PART_COMMENT_RE = re.compile(r"^;\s*\[(?:depth|gbuffer)(?:-static)?\s+part:(?P<part>[^\]]+)\]")
+_MESH_COMMENT_RE = re.compile(r"^;\s*\[mesh:(?P<name>[^\]]+)\](?:\s*\[vertex_count:(?P<count>\d+)\])?")
+_RESOURCE_SECTION_RE = re.compile(
+    r"^\[ResourceYihuan_(?P<token>.+?)_(?P<kind>IB|Position|Blend|Normal|Texcoord)\]$"
+)
+_DRAWINDEXED_RE = re.compile(r"^drawindexed\s*=\s*(?P<count>\d+)\s*,\s*(?P<first>\d+)\s*,\s*(?P<base>\d+)\s*$", re.IGNORECASE)
+_REGION_HASH_PREFIX_RE = re.compile(r"^(?P<hash>[0-9A-Fa-f]{8})")
 
 
 @dataclass(frozen=True)
@@ -32,6 +45,30 @@ class _LoadedImportResources:
     post_frame_b: list[tuple[float, float, float, float]] | None = None
 
 
+@dataclass(frozen=True)
+class _ExportedDrawRecord:
+    part_name: str
+    object_name: str
+    first_index: int
+    index_count: int
+
+
+@dataclass
+class _ExportedPartResources:
+    part_name: str
+    resource_token: str
+    ib_path: Path | None = None
+    position_path: Path | None = None
+    blend_path: Path | None = None
+    normal_path: Path | None = None
+    texcoord_path: Path | None = None
+    draws: list[_ExportedDrawRecord] | None = None
+
+    def __post_init__(self):
+        if self.draws is None:
+            self.draws = []
+
+
 def _ensure_collection(scene: bpy.types.Scene, collection_name: str) -> bpy.types.Collection:
     if not collection_name:
         return scene.collection
@@ -43,6 +80,15 @@ def _ensure_collection(scene: bpy.types.Scene, collection_name: str) -> bpy.type
     if scene.collection.children.get(existing_collection.name) is None:
         scene.collection.children.link(existing_collection)
 
+    return existing_collection
+
+
+def _ensure_child_collection(parent: bpy.types.Collection, collection_name: str) -> bpy.types.Collection:
+    existing_collection = bpy.data.collections.get(collection_name)
+    if existing_collection is None:
+        existing_collection = bpy.data.collections.new(collection_name)
+    if existing_collection.name not in parent.children.keys():
+        parent.children.link(existing_collection)
     return existing_collection
 
 
@@ -150,6 +196,20 @@ def _assign_section_vertex_group(imported_object: bpy.types.Object, section_sele
     vertex_group.add(list(range(len(imported_object.data.vertices))), 1.0, "REPLACE")
 
 
+def _slice_object_name(*, object_prefix: str, ib_hash: str, detected_slice) -> str:
+    hash_value = (detected_slice.display_ib_hash or ib_hash or "unknown").lower()
+    base_name = f"{hash_value}-{int(detected_slice.index_count)}-{int(detected_slice.first_index)}"
+    prefix = object_prefix.strip()
+    return f"{prefix}_{base_name}" if prefix else base_name
+
+
+def _roundtrip_region_hash(part_name: str, source_ib_hash: str) -> str:
+    match = _REGION_HASH_PREFIX_RE.match(part_name)
+    if match:
+        return match.group("hash").lower()
+    return source_ib_hash.lower()
+
+
 def _apply_section_transform(
     imported_object: bpy.types.Object,
     section_transform: SectionTransform,
@@ -212,6 +272,288 @@ def _load_import_resources(resolved_bundle: ResolvedImportBundle) -> _LoadedImpo
         positions=positions,
         packed_uv_entries=packed_uv_entries,
     )
+
+
+def _load_exported_package_layout(export_root: Path, source_ib_hash: str) -> list[_ExportedPartResources]:
+    ini_path = export_root / f"{source_ib_hash}.ini"
+    if not ini_path.is_file():
+        raise ValueError(f"Missing exported package INI: {ini_path}")
+
+    parts_by_name: dict[str, _ExportedPartResources] = {}
+    current_section: tuple[str, str] | None = None
+    current_part_name: str | None = None
+    current_stage_part_name: str | None = None
+    pending_mesh_name: str | None = None
+    seen_draws: set[tuple[str, int, int]] = set()
+
+    for raw_line in ini_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line:
+            current_section = None
+            pending_mesh_name = None
+            continue
+
+        part_match = _PART_COMMENT_RE.match(line)
+        if part_match:
+            current_part_name = part_match.group("part").strip()
+            continue
+
+        stage_match = _STAGE_PART_COMMENT_RE.match(line)
+        if stage_match:
+            current_stage_part_name = stage_match.group("part").strip()
+            pending_mesh_name = None
+            continue
+
+        mesh_match = _MESH_COMMENT_RE.match(line)
+        if mesh_match:
+            pending_mesh_name = mesh_match.group("name").strip()
+            continue
+
+        section_match = _RESOURCE_SECTION_RE.match(line)
+        if section_match:
+            token = section_match.group("token").strip()
+            kind = section_match.group("kind").strip()
+            current_section = (token, kind)
+            part_name = current_part_name or token
+            parts_by_name.setdefault(part_name, _ExportedPartResources(part_name=part_name, resource_token=token))
+            continue
+
+        if current_section is not None and line.lower().startswith("filename ="):
+            token, kind = current_section
+            part_name = current_part_name or token
+            part = parts_by_name.setdefault(part_name, _ExportedPartResources(part_name=part_name, resource_token=token))
+            filename = line.split("=", 1)[1].strip()
+            file_path = (export_root / filename).resolve()
+            if kind == "IB":
+                part.ib_path = file_path
+            elif kind == "Position":
+                part.position_path = file_path
+            elif kind == "Blend":
+                part.blend_path = file_path
+            elif kind == "Normal":
+                part.normal_path = file_path
+            elif kind == "Texcoord":
+                part.texcoord_path = file_path
+            continue
+
+        draw_match = _DRAWINDEXED_RE.match(line)
+        if draw_match and current_stage_part_name and pending_mesh_name:
+            index_count = int(draw_match.group("count"))
+            first_index = int(draw_match.group("first"))
+            dedupe_key = (current_stage_part_name, first_index, index_count)
+            if dedupe_key in seen_draws:
+                continue
+            seen_draws.add(dedupe_key)
+            part = parts_by_name.setdefault(
+                current_stage_part_name,
+                _ExportedPartResources(part_name=current_stage_part_name, resource_token=current_stage_part_name),
+            )
+            part.draws.append(
+                _ExportedDrawRecord(
+                    part_name=current_stage_part_name,
+                    object_name=pending_mesh_name,
+                    first_index=first_index,
+                    index_count=index_count,
+                )
+            )
+            continue
+
+    ordered_parts = sorted(parts_by_name.values(), key=lambda item: item.part_name)
+    if not ordered_parts:
+        raise ValueError(f"{ini_path}: no exported parts were found.")
+    return ordered_parts
+
+
+def _build_triangle_slice(indices: list[int], *, first_index: int, index_count: int) -> list[tuple[int, int, int]]:
+    if first_index < 0 or index_count <= 0:
+        raise ValueError(f"Invalid drawindexed range: first={first_index} count={index_count}")
+    end_index = first_index + index_count
+    if end_index > len(indices):
+        raise ValueError(
+            f"Drawindexed range {first_index}+{index_count} exceeds IB size {len(indices)}."
+        )
+    if index_count % 3 != 0:
+        raise ValueError(f"Drawindexed count must be a multiple of 3, got {index_count}.")
+    draw_indices = indices[first_index:end_index]
+    return [
+        (draw_indices[offset], draw_indices[offset + 1], draw_indices[offset + 2])
+        for offset in range(0, len(draw_indices), 3)
+    ]
+
+
+def _import_exported_draw(
+    context: bpy.types.Context,
+    *,
+    target_collection: bpy.types.Collection,
+    object_name: str,
+    source_ib_hash: str,
+    part_name: str,
+    draw_record: _ExportedDrawRecord,
+    positions: list[tuple[float, float, float]],
+    packed_uv_entries: list[PackedHalf2x4],
+    blend_indices: list[tuple[int, int, int, int]],
+    blend_weights_u8: list[tuple[int, int, int, int]],
+    frame_a: list[tuple[float, float, float, float]],
+    frame_b: list[tuple[float, float, float, float]],
+    triangles: list[tuple[int, int, int]],
+    profile_id: str,
+    flip_uv_v: bool,
+    shade_smooth: bool,
+    store_orig_vertex_id: bool,
+) -> tuple[bpy.types.Object, dict[str, int]]:
+    converter = get_game_data_converter(profile_id)
+    geometry = build_compacted_geometry(positions, triangles, packed_uv_entries)
+    blender_positions = [converter.to_blender_position(position) for position in geometry.positions]
+    compact_blend_indices = [blend_indices[vertex_id] for vertex_id in geometry.original_vertex_ids]
+    compact_blend_weights = [
+        tuple(component / 255.0 for component in blend_weights_u8[vertex_id])
+        for vertex_id in geometry.original_vertex_ids
+    ]
+    compact_frame_a = [frame_a[vertex_id] for vertex_id in geometry.original_vertex_ids]
+    compact_frame_b = [frame_b[vertex_id] for vertex_id in geometry.original_vertex_ids]
+    decoded_frames = converter.decode_pre_cs_frames(compact_frame_a, compact_frame_b)
+    decoded_tangents = [frame.tangent for frame in decoded_frames]
+    decoded_normals = [frame.normal for frame in decoded_frames]
+    decoded_bitangent_signs = [frame.bitangent_sign for frame in decoded_frames]
+
+    mesh = bpy.data.meshes.new(object_name)
+    imported_object = bpy.data.objects.new(object_name, mesh)
+    target_collection.objects.link(imported_object)
+
+    mesh.from_pydata(blender_positions, [], geometry.triangles)
+    mesh.validate(verbose=False, clean_customdata=False)
+    mesh.update()
+
+    if shade_smooth:
+        for polygon in mesh.polygons:
+            polygon.use_smooth = True
+
+    _apply_uv_layer(mesh, geometry.packed_uv_entries, flip_uv_v=flip_uv_v)
+    _store_packed_uv_attributes(mesh, geometry.packed_uv_entries)
+    _apply_custom_normals(mesh, decoded_normals)
+    _store_decoded_tangent_frame_attributes(mesh, decoded_tangents, decoded_normals, decoded_bitangent_signs)
+
+    for slot_index in range(4):
+        _store_int_attribute(
+            mesh,
+            f"blend_index_{slot_index}",
+            [record[slot_index] for record in compact_blend_indices],
+        )
+        _store_float_attribute(
+            mesh,
+            f"blend_weight_{slot_index}",
+            [record[slot_index] for record in compact_blend_weights],
+        )
+    _assign_palette_groups(imported_object, compact_blend_indices, compact_blend_weights)
+
+    if store_orig_vertex_id:
+        _store_original_vertex_ids(mesh, geometry.original_vertex_ids)
+
+    imported_object["modimp_profile_id"] = profile_id
+    imported_object["modimp_source_ib_hash"] = source_ib_hash.lower()
+    imported_object["modimp_region_hash"] = _roundtrip_region_hash(part_name, source_ib_hash)
+    imported_object["modimp_roundtrip_part_name"] = part_name
+    imported_object["modimp_roundtrip_first_index"] = int(draw_record.first_index)
+    imported_object["modimp_roundtrip_index_count"] = int(draw_record.index_count)
+    imported_object["modimp_roundtrip_import"] = True
+
+    return imported_object, {
+        "vertex_count": len(mesh.vertices),
+        "triangle_count": len(geometry.triangles),
+    }
+
+
+def import_exported_package(
+    context: bpy.types.Context,
+    *,
+    export_dir: str,
+    source_ib_hash: str,
+    collection_name: str,
+    flip_uv_v: bool,
+    shade_smooth: bool,
+    store_orig_vertex_id: bool,
+) -> tuple[list[bpy.types.Object], dict[str, int]]:
+    export_root = Path(export_dir).resolve()
+    if not export_root.is_dir():
+        raise ValueError(f"Export Dir does not exist: {export_root}")
+
+    parts = _load_exported_package_layout(export_root, source_ib_hash)
+    root_collection = _ensure_collection(context.scene, collection_name)
+    imported_objects: list[bpy.types.Object] = []
+    total_vertex_count = 0
+    total_triangle_count = 0
+
+    for part in parts:
+        missing_paths = [
+            label
+            for label, path in (
+                ("IB", part.ib_path),
+                ("Position", part.position_path),
+                ("Blend", part.blend_path),
+                ("Normal", part.normal_path),
+                ("Texcoord", part.texcoord_path),
+            )
+            if path is None or not path.is_file()
+        ]
+        if missing_paths:
+            raise ValueError(f"{part.part_name}: missing exported buffer(s): {', '.join(missing_paths)}")
+
+        indices = read_u16_buffer(str(part.ib_path))
+        positions = read_vb0_positions(str(part.position_path))
+        packed_uv_entries = read_half2x4_records(str(part.texcoord_path))
+        blend_indices, blend_weights_u8 = read_weight_pairs(str(part.blend_path), vertex_count=len(positions))
+        frame_a, frame_b = read_pre_cs_frame_pairs(str(part.normal_path), vertex_count=len(positions))
+
+        draw_records = list(part.draws)
+        if not draw_records:
+            draw_records = [
+                _ExportedDrawRecord(
+                    part_name=part.part_name,
+                    object_name=part.part_name,
+                    first_index=0,
+                    index_count=len(indices),
+                )
+            ]
+
+        part_collection = _ensure_child_collection(root_collection, part.part_name)
+        for draw_record in draw_records:
+            triangles = _build_triangle_slice(
+                indices,
+                first_index=draw_record.first_index,
+                index_count=draw_record.index_count,
+            )
+            imported_object, import_stats = _import_exported_draw(
+                context,
+                target_collection=part_collection,
+                object_name=draw_record.object_name,
+                source_ib_hash=source_ib_hash,
+                part_name=part.part_name,
+                draw_record=draw_record,
+                positions=positions,
+                packed_uv_entries=packed_uv_entries,
+                blend_indices=blend_indices,
+                blend_weights_u8=blend_weights_u8,
+                frame_a=frame_a,
+                frame_b=frame_b,
+                triangles=triangles,
+                profile_id=YIHUAN_PROFILE.profile_id,
+                flip_uv_v=flip_uv_v,
+                shade_smooth=shade_smooth,
+                store_orig_vertex_id=store_orig_vertex_id,
+            )
+            imported_objects.append(imported_object)
+            total_vertex_count += import_stats["vertex_count"]
+            total_triangle_count += import_stats["triangle_count"]
+
+    if not imported_objects:
+        raise ValueError("No exported package draws were imported.")
+
+    _select_imported_objects(context, imported_objects, active_object=imported_objects[0])
+    return imported_objects, {
+        "vertex_count": total_vertex_count,
+        "triangle_count": total_triangle_count,
+        "slice_count": len(imported_objects),
+    }
 
 
 def _import_single_slice(
@@ -331,6 +673,12 @@ def _import_single_slice(
 
     imported_object["modimp_profile_id"] = resolved_bundle.profile_id
     imported_object["modimp_ib_hash"] = resolved_bundle.ib_hash
+    imported_object["modimp_source_ib_hash"] = resolved_bundle.ib_hash
+    imported_object["modimp_region_hash"] = (
+        resolved_bundle.selected_slice.display_ib_hash or resolved_bundle.selected_slice.raw_ib_hash
+    )
+    imported_object["modimp_region_index_count"] = int(resolved_bundle.selected_slice.index_count)
+    imported_object["modimp_region_first_index"] = int(resolved_bundle.selected_slice.first_index)
     if resolved_bundle.selected_slice.display_ib_hash is not None:
         imported_object["modimp_display_ib_hash"] = resolved_bundle.selected_slice.display_ib_hash
     imported_object["modimp_ib_txt_path"] = resolved_bundle.selected_slice.ib_txt_path
@@ -347,6 +695,10 @@ def _import_single_slice(
     imported_object["modimp_draw_indices"] = ",".join(str(value) for value in resolved_bundle.selected_slice.draw_indices)
     if resolved_bundle.selected_slice.last_consumer_draw_index is not None:
         imported_object["modimp_last_consumer_draw_index"] = int(resolved_bundle.selected_slice.last_consumer_draw_index)
+    if resolved_bundle.selected_slice.depth_vs_hashes:
+        imported_object["modimp_depth_vs_hashes"] = ",".join(resolved_bundle.selected_slice.depth_vs_hashes)
+    if resolved_bundle.selected_slice.gbuffer_vs_hashes:
+        imported_object["modimp_gbuffer_vs_hashes"] = ",".join(resolved_bundle.selected_slice.gbuffer_vs_hashes)
     if resolved_bundle.selected_slice.producer_dispatch_index is not None:
         imported_object["modimp_producer_dispatch_index"] = int(resolved_bundle.selected_slice.producer_dispatch_index)
     if resolved_bundle.selected_slice.producer_cs_hash is not None:
@@ -422,13 +774,12 @@ def import_detected_model(
         )
     )
 
-    for slice_index, detected_slice in enumerate(detected_model.slices, start=1):
-        if detected_slice.display_ib_hash is not None:
-            slice_name = f"{object_prefix}_{detected_slice.display_ib_hash}"
-        elif detected_slice.section_selector is None:
-            slice_name = f"{object_prefix}_slice_{slice_index:02d}"
-        else:
-            slice_name = f"{object_prefix}_section_{detected_slice.section_selector:03d}"
+    for detected_slice in detected_model.slices:
+        slice_name = _slice_object_name(
+            object_prefix=object_prefix,
+            ib_hash=detected_model.ib_hash,
+            detected_slice=detected_slice,
+        )
 
         resolved_bundle = ResolvedImportBundle(
             profile_id=detected_model.profile_id,
@@ -496,11 +847,16 @@ def import_resolved_slice(
     apply_section_transform: bool,
 ) -> tuple[bpy.types.Object, dict[str, int]]:
     """Import one resolved slice bundle."""
+    fallback_object_name = _slice_object_name(
+        object_prefix="",
+        ib_hash=resolved_bundle.ib_hash,
+        detected_slice=resolved_bundle.selected_slice,
+    )
     return _import_single_slice(
         context,
         resolved_bundle=resolved_bundle,
         loaded_resources=None,
-        object_name=object_name or resolved_bundle.model_name,
+        object_name=object_name or fallback_object_name,
         collection_name=collection_name,
         flip_uv_v=flip_uv_v,
         shade_smooth=shade_smooth,

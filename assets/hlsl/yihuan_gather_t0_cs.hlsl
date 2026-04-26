@@ -6,7 +6,7 @@
 // Expected bindings:
 //   t0 = Global T0 store
 //   t1 = External palette map, palette[localBone] = globalBoneIndex
-//   t2 = Palette meta, meta[0] = local_bone_count
+//   t2 = Palette meta, meta[0] = local_bone_count as R32_FLOAT
 //   u0 = Local T0 UAV
 //
 // Layout:
@@ -16,7 +16,7 @@
 
 StructuredBuffer<uint4> GlobalT0Store : register(t0);
 Buffer<uint> LocalPalette             : register(t1);
-Buffer<uint> PaletteMeta              : register(t2);
+Buffer<float> PaletteMeta             : register(t2);
 
 RWStructuredBuffer<uint4> LocalT0UAV : register(u0);
 
@@ -24,7 +24,7 @@ RWStructuredBuffer<uint4> LocalT0UAV : register(u0);
 void main(uint3 tid : SV_DispatchThreadID)
 {
     uint local_row = tid.x;
-    uint local_bone_count = PaletteMeta[0];
+    uint local_bone_count = (uint)PaletteMeta[0];
     uint row_count = local_bone_count * 3;
     if (local_row >= row_count)
     {

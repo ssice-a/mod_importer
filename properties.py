@@ -63,12 +63,12 @@ def register_addon_properties():
     bpy.types.Scene.modimp_object_prefix = bpy.props.StringProperty(
         name="Object Prefix",
         default="",
-        description="Optional imported object name prefix; leave blank to use the resolved model name",
+        description="Optional imported object name prefix; leave blank for hash-indexcount-firstindex names",
     )
     bpy.types.Scene.modimp_import_collection_name = bpy.props.StringProperty(
         name="Import Collection",
-        default="Mod Importer Imports",
-        description="Collection that will receive imported objects",
+        default="",
+        description="Collection that will receive imported objects; blank uses the resolved big IB hash",
     )
     bpy.types.Scene.modimp_use_pre_cs_source = bpy.props.BoolProperty(
         name="Use Pre-CS Source",
@@ -198,8 +198,8 @@ def register_addon_properties():
 
     bpy.types.Scene.modimp_export_collection_name = bpy.props.StringProperty(
         name="Export Collection",
-        default="Mod Importer Imports",
-        description="Collection to rebuild into shared buffers during export",
+        default="",
+        description="Root export collection; blank uses the resolved source IB hash when available",
     )
     bpy.types.Scene.modimp_export_dir = bpy.props.StringProperty(
         name="Export Dir",

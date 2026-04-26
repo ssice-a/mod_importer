@@ -106,6 +106,9 @@ class _ResolvedDrawRecord:
     t7_buf_path: str | None
     cb1_buf_path: str | None
     cb2_buf_path: str | None
+    vs_hash: str | None
+    ps_hash: str | None
+    vs_resource_labels: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -241,6 +244,15 @@ def _build_draw_records(draw_events: dict[int, _DrawEventRecord]) -> tuple[_Reso
         if raw_ib_hash is None or ib_txt_path is None:
             continue
 
+        artifacts = [
+            artifact
+            for artifact_group in event.resources.values()
+            for artifact in artifact_group.values()
+        ]
+        vs_hash = next((artifact.vs_hash for artifact in artifacts if artifact.vs_hash), None)
+        ps_hash = next((artifact.ps_hash for artifact in artifacts if artifact.ps_hash), None)
+        vs_resource_labels = tuple(sorted(event.resources.keys()))
+
         draw_records.append(
             _ResolvedDrawRecord(
                 event_index=event_index,
@@ -266,9 +278,21 @@ def _build_draw_records(draw_events: dict[int, _DrawEventRecord]) -> tuple[_Reso
                 or _artifact_output(event.resources, "vs-t5", "buf"),
                 cb1_buf_path=_artifact_output(event.resources, "vs-cb1", "buf"),
                 cb2_buf_path=_artifact_output(event.resources, "vs-cb2", "buf"),
+                vs_hash=vs_hash,
+                ps_hash=ps_hash,
+                vs_resource_labels=vs_resource_labels,
             )
         )
     return tuple(draw_records)
+
+
+def _draw_stage(record: _ResolvedDrawRecord) -> str:
+    labels = set(record.vs_resource_labels)
+    if "vs-t6" in labels or "vs-t7" in labels:
+        return "gbuffer"
+    if "vs-t3" in labels or "vs-t4" in labels or "vs-t5" in labels:
+        return "depth"
+    return ""
 
 
 @lru_cache(maxsize=64)
@@ -449,16 +473,12 @@ def _read_section_selector(vb1_buf_path: str | None, vb1_layout_path: str | None
 
 
 def _build_model_bundle(scan_result: _FrameScanResult, raw_ib_hash: str) -> DetectedModelBundle:
-    matching_draws = [record for record in scan_result.draw_records if record.raw_ib_hash == raw_ib_hash]
-    if not matching_draws:
+    raw_matching_draws = [record for record in scan_result.draw_records if record.raw_ib_hash == raw_ib_hash]
+    if not raw_matching_draws:
         raise ValueError(f"Could not find any draw slices for IB hash {raw_ib_hash} in {scan_result.frame_dump_dir}")
 
-    slice_groups: dict[tuple[int, int], list[_ResolvedDrawRecord]] = defaultdict(list)
-    for draw_record in matching_draws:
-        slice_groups[(draw_record.first_index, draw_record.index_count)].append(draw_record)
-
     main_draw = max(
-        matching_draws,
+        raw_matching_draws,
         key=lambda record: (
             int(record.index_count),
             int(record.event_index),
@@ -467,6 +487,22 @@ def _build_model_bundle(scan_result: _FrameScanResult, raw_ib_hash: str) -> Dete
     post_cs_vb0_hash = _normalize_hash(main_draw.vb0_hash)
     if not post_cs_vb0_hash or not main_draw.vb0_buf_path:
         raise ValueError(f"Could not resolve the post-CS VB0 for IB hash {raw_ib_hash}")
+
+    # The same source IB can appear in unrelated helper/material passes. For importing
+    # the complete skinned model, keep the draw slices that consume the same final
+    # post-CS VB0 pool as the main draw. This preserves tiny first-index=0 slices
+    # such as the 366-index draw while avoiding unrelated uses of the big IB.
+    matching_draws = [
+        record
+        for record in raw_matching_draws
+        if _normalize_hash(record.vb0_hash) == post_cs_vb0_hash
+    ]
+    if not matching_draws:
+        matching_draws = raw_matching_draws
+
+    slice_groups: dict[tuple[int, int], list[_ResolvedDrawRecord]] = defaultdict(list)
+    for draw_record in matching_draws:
+        slice_groups[(draw_record.first_index, draw_record.index_count)].append(draw_record)
 
     dispatch_batches = _build_dispatch_batches(
         scan_result.dispatch_records,
@@ -510,6 +546,12 @@ def _build_model_bundle(scan_result: _FrameScanResult, raw_ib_hash: str) -> Dete
 
         selected_draw = draw_group[-1]
         section_selector = _read_section_selector(selected_draw.vb1_buf_path, selected_draw.vb1_layout_path)
+        depth_vs_hashes = tuple(
+            sorted({str(record.vs_hash) for record in draw_group if record.vs_hash and _draw_stage(record) == "depth"})
+        )
+        gbuffer_vs_hashes = tuple(
+            sorted({str(record.vs_hash) for record in draw_group if record.vs_hash and _draw_stage(record) == "gbuffer"})
+        )
         slices.append(
             DetectedSlice(
                 ib_txt_path=selected_draw.ib_txt_path,
@@ -520,6 +562,8 @@ def _build_model_bundle(scan_result: _FrameScanResult, raw_ib_hash: str) -> Dete
                 index_count=int(index_count),
                 used_vertex_start=int(used_vertex_start),
                 used_vertex_end=int(used_vertex_end),
+                producer_start_vertex=None if producer_batch is None else int(producer_batch.start_vertex),
+                producer_vertex_count=None if producer_batch is None else int(producer_batch.vertex_count),
                 vb1_layout_path=selected_draw.vb1_layout_path,
                 section_selector=section_selector,
                 producer_dispatch_index=None if producer_batch is None else int(producer_batch.dispatch_index),
@@ -528,6 +572,8 @@ def _build_model_bundle(scan_result: _FrameScanResult, raw_ib_hash: str) -> Dete
                 last_cs_hash=None if producer_batch is None else producer_batch.cs_hash,
                 last_cs_cb0_hash=None if producer_batch is None else producer_batch.cb0_hash,
                 last_consumer_draw_index=int(draw_group[-1].event_index),
+                depth_vs_hashes=depth_vs_hashes,
+                gbuffer_vs_hashes=gbuffer_vs_hashes,
                 section_transform=None,
             )
         )
@@ -544,7 +590,7 @@ def _build_model_bundle(scan_result: _FrameScanResult, raw_ib_hash: str) -> Dete
         profile_id=YIHUAN_PROFILE.profile_id,
         frame_dump_dir=scan_result.frame_dump_dir,
         ib_hash=raw_ib_hash,
-        model_name=f"{YIHUAN_PROFILE.profile_id}_ib_{raw_ib_hash}",
+        model_name=raw_ib_hash,
         vb0_buf_path=str(main_draw.vb0_buf_path),
         pre_cs_vb0_buf_path=str(pre_cs_vb0_path),
         post_cs_vb0_buf_path=str(main_draw.vb0_buf_path),

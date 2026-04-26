@@ -71,5 +71,7 @@ class VIEW3D_PT_mod_importer(bpy.types.Panel):
         export_box.label(text="Export", icon="EXPORT")
         export_box.prop(scene, "modimp_export_collection_name")
         export_box.operator("modimp.create_export_collection", icon="OUTLINER_COLLECTION")
+        export_box.operator("modimp.create_export_part", icon="GROUP")
         export_box.prop(scene, "modimp_export_dir")
         export_box.operator("modimp.export_collection_buffers", icon="PACKAGE")
+        export_box.operator("modimp.import_exported_package", icon="IMPORT")

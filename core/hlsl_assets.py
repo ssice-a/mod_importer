@@ -12,7 +12,12 @@ _PROFILE_HLSL_FILES = {
     YIHUAN_PROFILE.profile_id: (
         "yihuan_collect_t0_cs.hlsl",
         "yihuan_gather_t0_cs.hlsl",
+        "yihuan_skin_mesh_cs.hlsl",
     ),
+}
+
+_PROFILE_STALE_HLSL_FILES = {
+    YIHUAN_PROFILE.profile_id: (),
 }
 
 
@@ -34,6 +39,18 @@ def export_profile_hlsl_assets(profile_id: str, output_directory: str | Path) ->
         source_path = assets_dir / file_name
         if not source_path.is_file():
             raise ValueError(f"Missing bundled HLSL asset: {source_path}")
-        shutil.copy2(source_path, output_dir / file_name)
+        target_path = output_dir / file_name
+        if target_path.is_file() and target_path.read_bytes() == source_path.read_bytes():
+            continue
+        shutil.copy2(source_path, target_path)
+        for compiled_path in output_dir.glob(f"{target_path.stem}*.bin"):
+            compiled_path.unlink()
+
+    for file_name in _PROFILE_STALE_HLSL_FILES.get(profile_id, ()):
+        if file_name in required_files:
+            continue
+        stale_path = output_dir / file_name
+        if stale_path.is_file():
+            stale_path.unlink()
 
     return output_dir

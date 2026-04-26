@@ -1,42 +1,56 @@
 // =========================================================
 // yihuan_collect_t0_cs.hlsl
 //
-// Collect the currently bound local T0 rows into a global store.
+// Collect is keyed by current cs-cb0 contents plus INI-provided collect meta.
 //
-// Expected bindings:
-//   t0 = Original local T0 palette (current draw/dispatch binding)
-//   t1 = External palette map, palette[localBone] = globalBoneIndex
-//   t2 = Palette meta, meta[0] = local_bone_count
-//   u0 = Global T0 store UAV
-//
-// Layout:
-//   local palette row  = localBone * 3 + row
-//   global palette row = globalBone * 3 + row
+// Expected bindings inherited from the original skin CS:
+//   cb0 = original skin dispatch params
+//   t0  = original local T0 palette for that dispatch
+// Expected bindings set by the INI:
+//   t2  = uint collect meta: expected_start expected_count global_bone_base bone_count
+//   u0  = global T0 store UAV
 // =========================================================
 
-StructuredBuffer<uint4> OriginalT0 : register(t0);
-Buffer<uint> LocalPalette          : register(t1);
-Buffer<uint> PaletteMeta           : register(t2);
+cbuffer OriginalSkinCB0 : register(b0)
+{
+    uint4 SkinCB0_0;
+};
 
+StructuredBuffer<uint4> OriginalT0 : register(t0);
+Buffer<uint> CollectMeta : register(t2);
 RWStructuredBuffer<uint4> GlobalT0Store : register(u0);
+
+bool CurrentCB0Matches(uint expected_start, uint expected_count)
+{
+    bool primary_form = (SkinCB0_0.y == expected_start && SkinCB0_0.z == expected_count);
+    bool final_form = (SkinCB0_0.z == expected_start && SkinCB0_0.w == expected_count);
+    return primary_form || final_form;
+}
 
 [numthreads(64, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID)
 {
+    uint expected_start = CollectMeta[0];
+    uint expected_count = CollectMeta[1];
+    uint global_bone_base = CollectMeta[2];
+    uint bone_count = CollectMeta[3];
+    if (!CurrentCB0Matches(expected_start, expected_count))
+    {
+        return;
+    }
+
     uint local_row = tid.x;
-    uint local_bone_count = PaletteMeta[0];
-    uint row_count = local_bone_count * 3;
+    uint row_count = bone_count * 3u;
     if (local_row >= row_count)
     {
         return;
     }
 
-    uint local_bone = local_row / 3;
-    uint row_in_bone = local_row % 3;
-    uint global_bone = LocalPalette[local_bone];
+    uint local_bone = local_row / 3u;
+    uint row_in_bone = local_row % 3u;
+    uint global_bone = global_bone_base + local_bone;
 
-    uint src_row = local_bone * 3 + row_in_bone;
-    uint dst_row = global_bone * 3 + row_in_bone;
-
+    uint src_row = local_bone * 3u + row_in_bone;
+    uint dst_row = global_bone * 3u + row_in_bone;
     GlobalT0Store[dst_row] = OriginalT0[src_row];
 }

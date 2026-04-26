@@ -24,7 +24,9 @@ if bpy is not None:
         operators.MODIMP_OT_resolve_from_ib_hash,
         operators.MODIMP_OT_import_resolved_model,
         operators.MODIMP_OT_create_export_collection,
+        operators.MODIMP_OT_create_export_part,
         operators.MODIMP_OT_export_collection_buffers,
+        operators.MODIMP_OT_import_exported_package,
         panel.VIEW3D_PT_mod_importer,
     )
 else:
