@@ -975,6 +975,7 @@ class MODIMP_OT_export_collection_buffers(bpy.types.Operator):
                 collection_name=scene.modimp_export_collection_name.strip(),
                 export_dir=scene.modimp_export_dir.strip(),
                 frame_dump_dir=scene.modimp_frame_dump_dir.strip() or None,
+                flip_uv_v=scene.modimp_flip_v,
             )
         except Exception as exc:  # pylint: disable=broad-except
             self.report({"ERROR"}, str(exc))

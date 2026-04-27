@@ -11,7 +11,7 @@ from pathlib import Path
 import bpy
 from mathutils import Vector
 
-from .game_data import DecodedTangentFrame, get_game_data_converter
+from .game_data import get_game_data_converter
 from .discovery import discover_yihuan_model
 from .hlsl_assets import export_profile_hlsl_assets
 from .io import (
@@ -355,6 +355,16 @@ def _optional_point_vector_attribute(
     return [default] * len(mesh.vertices), True
 
 
+def _find_uv_layer(mesh: bpy.types.Mesh, *names: str) -> bpy.types.MeshUVLoopLayer | None:
+    wanted = {name.casefold() for name in names if name}
+    if not wanted:
+        return None
+    for uv_layer in mesh.uv_layers:
+        if uv_layer.name.casefold() in wanted:
+            return uv_layer
+    return None
+
+
 def _read_point_float_attribute(mesh: bpy.types.Mesh, name: str) -> list[float]:
     attribute = mesh.attributes.get(name)
     if attribute is None:
@@ -524,54 +534,6 @@ def _vector_key(vector: tuple[float, float, float]) -> tuple[int, int, int]:
     return tuple(int(round(float(component) * 1_000_000.0)) for component in vector)
 
 
-def _decode_legacy_frames(
-    mesh: bpy.types.Mesh,
-    *,
-    profile_id: str,
-) -> list[DecodedTangentFrame] | None:
-    frame0_xyz = _find_point_vector_attribute(mesh, "pre_cs_frame0_xyz")
-    frame0_w = _find_point_float_attribute(mesh, "pre_cs_frame0_w")
-    frame1_xyz = _find_point_vector_attribute(mesh, "pre_cs_frame1_xyz")
-    frame1_w = _find_point_float_attribute(mesh, "pre_cs_frame1_w")
-    if frame0_xyz is None or frame0_w is None or frame1_xyz is None or frame1_w is None:
-        return None
-
-    converter = get_game_data_converter(profile_id)
-    raw_frame_a = [
-        (float(x_value), float(y_value), float(z_value), float(w_value))
-        for (x_value, y_value, z_value), w_value in zip(frame0_xyz, frame0_w)
-    ]
-    raw_frame_b = [
-        (float(x_value), float(y_value), float(z_value), float(w_value))
-        for (x_value, y_value, z_value), w_value in zip(frame1_xyz, frame1_w)
-    ]
-    return converter.decode_pre_cs_frames(raw_frame_a, raw_frame_b)
-
-
-def _decoded_point_frames(
-    mesh: bpy.types.Mesh,
-    *,
-    profile_id: str,
-) -> tuple[list[tuple[float, float, float]], list[tuple[float, float, float]], list[float]]:
-    tangents = _find_point_vector_attribute(mesh, "modimp_tangent")
-    normals = _find_point_vector_attribute(mesh, "modimp_normal")
-    bitangent_signs = _find_point_float_attribute(mesh, "modimp_bitangent_sign")
-    if tangents is not None and normals is not None and bitangent_signs is not None:
-        return tangents, normals, bitangent_signs
-
-    legacy_frames = _decode_legacy_frames(mesh, profile_id=profile_id)
-    if legacy_frames is None:
-        raise ValueError(
-            f"{mesh.name}: missing decoded tangent-space attributes. "
-            "Expected modimp_tangent/modimp_normal/modimp_bitangent_sign."
-        )
-    return (
-        [frame.tangent for frame in legacy_frames],
-        [frame.normal for frame in legacy_frames],
-        [frame.bitangent_sign for frame in legacy_frames],
-    )
-
-
 def _prepare_loop_tangent_frames(
     mesh: bpy.types.Mesh,
     *,
@@ -677,6 +639,7 @@ def _fallback_vertex_frame(mesh: bpy.types.Mesh, vertex_index: int) -> tuple[tup
 def _extract_object_payload(
     obj: bpy.types.Object,
     *,
+    flip_uv_v: bool = False,
     fallback_profile_id: str | None = None,
     fallback_original_first_index: int | None = None,
     fallback_original_index_count: int | None = None,
@@ -697,31 +660,27 @@ def _extract_object_payload(
 
     depsgraph = bpy.context.evaluated_depsgraph_get()
     missing_optional_attributes: list[str] = []
-    fallback_frames: tuple[list[tuple[float, float, float]], list[tuple[float, float, float]], list[float]] | None = None
-    fallback_frames_unavailable = False
-
     mesh_copy, baked_shape_keys = _triangulated_mesh_copy(obj, depsgraph=depsgraph)
     blend_indices, blend_weights, local_palette_count = _normalized_top4_weights(obj, mesh=mesh_copy)
-    packed_uv1, missing_uv1 = _optional_point_vector_attribute(mesh_copy, "packed_uv1")
-    packed_uv2, missing_uv2 = _optional_point_vector_attribute(mesh_copy, "packed_uv2")
-    packed_uv3, missing_uv3 = _optional_point_vector_attribute(mesh_copy, "packed_uv3")
-    if missing_uv1:
+    uv0_layer = _find_uv_layer(mesh_copy, "UV0") or mesh_copy.uv_layers.active
+    if uv0_layer is None:
+        bpy.data.meshes.remove(mesh_copy)
+        raise ValueError(f"{obj.name}: UV0 or an active UV layer is required for export")
+    uv1_layer = _find_uv_layer(mesh_copy, "UV1", "packed_uv1")
+    uv2_layer = _find_uv_layer(mesh_copy, "UV2", "packed_uv2")
+    uv3_layer = _find_uv_layer(mesh_copy, "UV3", "packed_uv3")
+    packed_uv1, missing_uv1_attr = _optional_point_vector_attribute(mesh_copy, "packed_uv1")
+    packed_uv2, missing_uv2_attr = _optional_point_vector_attribute(mesh_copy, "packed_uv2")
+    packed_uv3, missing_uv3_attr = _optional_point_vector_attribute(mesh_copy, "packed_uv3")
+    if uv1_layer is None and missing_uv1_attr:
         missing_optional_attributes.append("packed_uv1")
-    if missing_uv2:
+    if uv2_layer is None and missing_uv2_attr:
         missing_optional_attributes.append("packed_uv2")
-    if missing_uv3:
+    if uv3_layer is None and missing_uv3_attr:
         missing_optional_attributes.append("packed_uv3")
-    active_uv_layer = mesh_copy.uv_layers.active
-    if active_uv_layer is None:
-        bpy.data.meshes.remove(mesh_copy)
-        raise ValueError(f"{obj.name}: active UV layer is required for export")
-    loop_frames = _prepare_loop_tangent_frames(mesh_copy, uv_layer_name=active_uv_layer.name)
-    if baked_shape_keys and loop_frames is None:
-        bpy.data.meshes.remove(mesh_copy)
-        raise ValueError(
-            f"{obj.name}: baked shape keys require recalculating normals/tangents, "
-            f"but Blender could not calculate tangents from UV layer '{active_uv_layer.name}'."
-        )
+    loop_frames = _prepare_loop_tangent_frames(mesh_copy, uv_layer_name=uv0_layer.name)
+    if loop_frames is None:
+        missing_optional_attributes.append("rebuild_tangent_frame_failed")
 
     positions: list[tuple[float, float, float]] = []
     packed_uv_entries: list[tuple[tuple[float, float], tuple[float, float], tuple[float, float], tuple[float, float]]] = []
@@ -736,6 +695,22 @@ def _extract_object_payload(
     def _uv_key(uv_pair: tuple[float, float]) -> tuple[int, int]:
         return (int(round(float(uv_pair[0]) * 1_000_000.0)), int(round(float(uv_pair[1]) * 1_000_000.0)))
 
+    def _to_game_uv_pair(uv_pair: tuple[float, float]) -> tuple[float, float]:
+        u_coord, v_coord = uv_pair
+        return (float(u_coord), 1.0 - float(v_coord) if flip_uv_v else float(v_coord))
+
+    def _loop_uv_pair(
+        loop_index: int,
+        source_vertex_index: int,
+        loop_uv_layer: bpy.types.MeshUVLoopLayer | None,
+        fallback_values: list[tuple[float, float, float]],
+    ) -> tuple[float, float]:
+        if loop_uv_layer is not None:
+            uv_value = loop_uv_layer.data[loop_index].uv
+            return (float(uv_value[0]), float(uv_value[1]))
+        fallback = fallback_values[source_vertex_index]
+        return (float(fallback[0]), float(fallback[1]))
+
     try:
         for polygon in mesh_copy.polygons:
             if polygon.loop_total != 3:
@@ -743,33 +718,27 @@ def _extract_object_payload(
             triangle: list[int] = []
             for loop_index in polygon.loop_indices:
                 source_vertex_index = mesh_copy.loops[loop_index].vertex_index
-                uv0 = tuple(float(value) for value in active_uv_layer.data[loop_index].uv)
+                uv0 = _to_game_uv_pair(tuple(float(value) for value in uv0_layer.data[loop_index].uv))
+                uv1 = _to_game_uv_pair(_loop_uv_pair(loop_index, source_vertex_index, uv1_layer, packed_uv1))
+                uv2 = _to_game_uv_pair(_loop_uv_pair(loop_index, source_vertex_index, uv2_layer, packed_uv2))
+                uv3 = _to_game_uv_pair(_loop_uv_pair(loop_index, source_vertex_index, uv3_layer, packed_uv3))
                 if loop_frames is not None:
                     loop_tangents, loop_normals, loop_signs = loop_frames
                     decoded_tangent = loop_tangents[loop_index]
                     decoded_normal = loop_normals[loop_index]
                     decoded_sign = loop_signs[loop_index]
                 else:
-                    if fallback_frames is None and not fallback_frames_unavailable:
-                        try:
-                            fallback_frames = _decoded_point_frames(mesh_copy, profile_id=profile_id)
-                        except ValueError:
-                            fallback_frames_unavailable = True
-                            missing_optional_attributes.append("decoded_tangent_frame")
-                    if fallback_frames is not None:
-                        fallback_tangents, fallback_normals, fallback_signs = fallback_frames
-                        decoded_tangent = _normalized_vector(fallback_tangents[source_vertex_index])
-                        decoded_normal = _normalized_vector(fallback_normals[source_vertex_index])
-                        decoded_sign = 1.0 if float(fallback_signs[source_vertex_index]) >= 0.0 else -1.0
-                    else:
-                        decoded_tangent, decoded_normal, decoded_sign = _fallback_vertex_frame(
-                            mesh_copy,
-                            source_vertex_index,
-                        )
+                    decoded_tangent, decoded_normal, decoded_sign = _fallback_vertex_frame(
+                        mesh_copy,
+                        source_vertex_index,
+                    )
 
                 key = (
                     source_vertex_index,
                     *_uv_key(uv0),
+                    *_uv_key(uv1),
+                    *_uv_key(uv2),
+                    *_uv_key(uv3),
                     *_vector_key(decoded_normal),
                     *_vector_key(decoded_tangent),
                     int(decoded_sign >= 0.0),
@@ -785,9 +754,9 @@ def _extract_object_payload(
                     packed_uv_entries.append(
                         (
                             (uv0[0], uv0[1]),
-                            (float(packed_uv1[source_vertex_index][0]), float(packed_uv1[source_vertex_index][1])),
-                            (float(packed_uv2[source_vertex_index][0]), float(packed_uv2[source_vertex_index][1])),
-                            (float(packed_uv3[source_vertex_index][0]), float(packed_uv3[source_vertex_index][1])),
+                            uv1,
+                            uv2,
+                            uv3,
                         )
                     )
                     out_blend_indices.append(blend_indices[source_vertex_index])
@@ -1246,6 +1215,7 @@ def _export_part_buffers(
     region_first_index: int | None,
     region_runtime_contract: dict[str, object],
     buffer_dir: Path,
+    flip_uv_v: bool,
 ) -> dict[str, object]:
     part_name = str(part_definition["part_name"])
     part_token = _resource_token(part_name)
@@ -1281,6 +1251,7 @@ def _export_part_buffers(
     for draw_index, obj in enumerate(mesh_objects):
         payload = _extract_object_payload(
             obj,
+            flip_uv_v=flip_uv_v,
             fallback_profile_id=str(region_runtime_contract.get("profile_id") or ""),
             fallback_original_first_index=region_first_index,
             fallback_original_index_count=region_index_count,
@@ -1534,7 +1505,7 @@ def _append_part_stage_draw(
                 [
                     f"  ; [depth part:{part['part_name']}] [vertex_count:{part['vertex_count']}]",
                     f"  ib = ResourceYihuan_{part_token}_IB",
-                    f"  vb0 = ResourceYihuan_{part_token}_SkinnedPosition",
+                    f"  vb0 = ResourceYihuan_{part_token}_SkinnedPositionVB",
                     f"  vs-t3 = ResourceYihuan_{part_token}_Texcoord",
                     f"  vs-t4 = ResourceYihuan_{part_token}_Position",
                     f"  vs-t5 = ResourceYihuan_{part_token}_SkinnedNormal",
@@ -1545,7 +1516,7 @@ def _append_part_stage_draw(
                 [
                     f"  ; [depth-static part:{part['part_name']}] [vertex_count:{part['vertex_count']}]",
                     f"  ib = ResourceYihuan_{part_token}_IB",
-                    f"  vb0 = ResourceYihuan_{part_token}_Position",
+                    f"  vb0 = ResourceYihuan_{part_token}_PositionVB",
                     f"  vs-t3 = ResourceYihuan_{part_token}_Texcoord",
                     f"  vs-t4 = ResourceYihuan_{part_token}_Position",
                     f"  vs-t5 = ResourceYihuan_{part_token}_Normal",
@@ -1557,7 +1528,7 @@ def _append_part_stage_draw(
                 [
                     f"  ; [gbuffer part:{part['part_name']}] [vertex_count:{part['vertex_count']}]",
                     f"  ib = ResourceYihuan_{part_token}_IB",
-                    f"  vb0 = ResourceYihuan_{part_token}_SkinnedPosition",
+                    f"  vb0 = ResourceYihuan_{part_token}_SkinnedPositionVB",
                     f"  vs-t4 = ResourceYihuan_{part_token}_SkinnedPosition",
                     f"  vs-t5 = ResourceYihuan_{part_token}_Texcoord",
                     f"  vs-t6 = ResourceYihuan_{part_token}_Position",
@@ -1569,7 +1540,7 @@ def _append_part_stage_draw(
                 [
                     f"  ; [gbuffer-static part:{part['part_name']}] [vertex_count:{part['vertex_count']}]",
                     f"  ib = ResourceYihuan_{part_token}_IB",
-                    f"  vb0 = ResourceYihuan_{part_token}_Position",
+                    f"  vb0 = ResourceYihuan_{part_token}_PositionVB",
                     f"  vs-t4 = ResourceYihuan_{part_token}_Position",
                     f"  vs-t5 = ResourceYihuan_{part_token}_Texcoord",
                     f"  vs-t6 = ResourceYihuan_{part_token}_Position",
@@ -1618,6 +1589,11 @@ def _append_yihuan_main_resource_sections(lines: list[str], parts: list[dict[str
                 f"array = {vertex_count * 3}",
                 f"filename = Buffer/{buffers['vb0_pre_cs']}",
                 "",
+                f"[ResourceYihuan_{token}_PositionVB]",
+                "type = Buffer",
+                "stride = 12",
+                f"filename = Buffer/{buffers['vb0_pre_cs']}",
+                "",
                 f"[ResourceYihuan_{token}_Blend]",
                 "type = StructuredBuffer",
                 "stride = 8",
@@ -1636,8 +1612,8 @@ def _append_yihuan_main_resource_sections(lines: list[str], parts: list[dict[str
                 "",
                 f"[ResourceYihuan_{token}_Texcoord]",
                 "type = Buffer",
-                "format = R16G16B16A16_FLOAT",
-                f"array = {vertex_count * 2}",
+                "format = R16G16_FLOAT",
+                f"array = {vertex_count * 4}",
                 f"filename = Buffer/{buffers['packed_uv']}",
                 "",
                 f"[ResourceYihuan_{token}_CB0]",
@@ -1655,6 +1631,10 @@ def _append_yihuan_main_resource_sections(lines: list[str], parts: list[dict[str
                 "type = Buffer",
                 "format = R32_FLOAT",
                 f"array = {vertex_count * 3}",
+                "",
+                f"[ResourceYihuan_{token}_SkinnedPositionVB]",
+                "type = Buffer",
+                "stride = 12",
                 "",
                 f"[ResourceYihuan_{token}_SkinnedNormal_UAV]",
                 "type = RWBuffer",
@@ -1695,7 +1675,7 @@ def _append_yihuan_bonestore_resource_sections(lines: list[str], parts: list[dic
                 f"[ResourcePalette_{token}]",
                 "type = Buffer",
                 "format = R32_UINT",
-                f"filename = Buffer/{part['expected_palette_file']}",
+                f"filename = BoneStore/Buffer/{part['expected_palette_file']}",
                 "",
                 f"[ResourcePaletteMeta_{token}]",
                 "type = Buffer",
@@ -1780,6 +1760,7 @@ def _write_yihuan_main_ini(
                         f"  run = CustomShader\\{_YIHUAN_BONESTORE_NAMESPACE}\\_SkinPart",
                         f"  ResourceYihuan_{token}_SkinnedNormal = copy ResourceYihuan_{token}_SkinnedNormal_UAV",
                         f"  ResourceYihuan_{token}_SkinnedPosition = copy ResourceYihuan_{token}_SkinnedPosition_UAV",
+                        f"  ResourceYihuan_{token}_SkinnedPositionVB = copy ResourceYihuan_{token}_SkinnedPosition_UAV",
                     ]
                 )
             lines.extend(
@@ -1945,19 +1926,15 @@ def _write_yihuan_runtime_ini(
             "",
             "; MARK: Shared custom shaders. BoneStore auto-runs only collect; main INI explicitly runs gather/skin.",
             "[CustomShader_CollectT0]",
-            "cs = hlsl\\yihuan_collect_t0_cs.hlsl",
+            "cs = BoneStore\\hlsl\\yihuan_collect_t0_cs.hlsl",
             "cs-u0 = ResourceGlobalT0Store_UAV",
             "dispatch = 64, 1, 1",
             "ResourceGlobalT0Store = copy ResourceGlobalT0Store_UAV",
             "",
             "[CustomShader_GatherT0]",
-            "cs = hlsl\\yihuan_gather_t0_cs.hlsl",
+            "cs = BoneStore\\hlsl\\yihuan_gather_t0_cs.hlsl",
             "cs-t0 = ResourceGlobalT0Store",
             "dispatch = 64, 1, 1",
-            "",
-            "[CustomShader_SkinPart]",
-            "cs = hlsl\\yihuan_skin_mesh_cs.hlsl",
-            "dispatch = 1024, 1, 1",
             "",
         ]
     )
@@ -1998,6 +1975,7 @@ def _export_region_package(
     source_ib_hash: str,
     buffer_dir: Path,
     require_runtime_contract: bool,
+    flip_uv_v: bool,
 ) -> dict[str, object]:
     region_hash = _region_collection_hash(region_collection)
     region_index_count = _collection_region_index_count(region_collection)
@@ -2036,6 +2014,7 @@ def _export_region_package(
             region_first_index=region_first_index,
             region_runtime_contract=region_runtime_contract,
             buffer_dir=buffer_dir,
+            flip_uv_v=flip_uv_v,
         )
         for part_definition in part_definitions
     ]
@@ -2085,6 +2064,7 @@ def export_collection_package(
     collection_name: str,
     export_dir: str,
     frame_dump_dir: str | None = None,
+    flip_uv_v: bool = False,
 ) -> dict[str, object]:
     """Export one strict sourceIB -> region -> part collection tree into runtime replacement assets."""
     collection = _get_collection(collection_name)
@@ -2114,6 +2094,7 @@ def export_collection_package(
             source_ib_hash=source_ib_hash,
             buffer_dir=buffer_dir,
             require_runtime_contract=runtime_skin_enabled,
+            flip_uv_v=flip_uv_v,
         )
         for region_collection in region_collections
     ]

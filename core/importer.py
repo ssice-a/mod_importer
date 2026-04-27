@@ -105,13 +105,19 @@ def _select_imported_objects(
     context.view_layer.objects.active = active_object
 
 
-def _apply_uv_layer(mesh: bpy.types.Mesh, packed_uv_entries: list[PackedHalf2x4], *, flip_uv_v: bool):
-    uv_layer = mesh.uv_layers.new(name="UV0")
-    for polygon in mesh.polygons:
-        for loop_index in polygon.loop_indices:
-            vertex_index = mesh.loops[loop_index].vertex_index
-            u_coord, v_coord = packed_uv_entries[vertex_index][0]
-            uv_layer.data[loop_index].uv = (u_coord, 1.0 - v_coord if flip_uv_v else v_coord)
+def _apply_uv_layers(mesh: bpy.types.Mesh, packed_uv_entries: list[PackedHalf2x4], *, flip_uv_v: bool):
+    created_layers: list[bpy.types.MeshUVLoopLayer] = []
+    for uv_index in range(4):
+        uv_layer = mesh.uv_layers.new(name=f"UV{uv_index}")
+        created_layers.append(uv_layer)
+        for polygon in mesh.polygons:
+            for loop_index in polygon.loop_indices:
+                vertex_index = mesh.loops[loop_index].vertex_index
+                u_coord, v_coord = packed_uv_entries[vertex_index][uv_index]
+                uv_layer.data[loop_index].uv = (u_coord, 1.0 - v_coord if flip_uv_v else v_coord)
+
+    if created_layers:
+        mesh.uv_layers.active = created_layers[0]
 
 
 def _store_vector_attribute(mesh: bpy.types.Mesh, name: str, values: list[tuple[float, float, float]]):
@@ -428,7 +434,7 @@ def _import_exported_draw(
         for polygon in mesh.polygons:
             polygon.use_smooth = True
 
-    _apply_uv_layer(mesh, geometry.packed_uv_entries, flip_uv_v=flip_uv_v)
+    _apply_uv_layers(mesh, geometry.packed_uv_entries, flip_uv_v=flip_uv_v)
     _store_packed_uv_attributes(mesh, geometry.packed_uv_entries)
     _apply_custom_normals(mesh, decoded_normals)
     _store_decoded_tangent_frame_attributes(mesh, decoded_tangents, decoded_normals, decoded_bitangent_signs)
@@ -633,7 +639,7 @@ def _import_single_slice(
         for polygon in mesh.polygons:
             polygon.use_smooth = True
 
-    _apply_uv_layer(mesh, geometry.packed_uv_entries, flip_uv_v=flip_uv_v)
+    _apply_uv_layers(mesh, geometry.packed_uv_entries, flip_uv_v=flip_uv_v)
     _store_packed_uv_attributes(mesh, geometry.packed_uv_entries)
 
     if compact_normals is not None:
