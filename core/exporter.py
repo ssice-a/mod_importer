@@ -225,7 +225,8 @@ def _write_yihuan_collect_t0_hlsl(*, hlsl_dir: Path, capture_ranges: list[dict[s
             "//   cb0 = original skin dispatch params",
             "//   t0  = original local T0 palette for that dispatch",
             "// Expected bindings set by the INI:",
-            "//   t2  = uint collect meta: expected_start expected_count global_bone_base bone_count",
+            "//   t2  = collect meta buffer, four uints:",
+            "//         expected_start expected_count global_bone_base bone_count",
             "//   u0  = global T0 store UAV",
             "// =========================================================",
             "",
@@ -245,13 +246,19 @@ def _write_yihuan_collect_t0_hlsl(*, hlsl_dir: Path, capture_ranges: list[dict[s
             "    return primary_form || final_form;",
             "}",
             "",
+            "uint4 LoadCollectMeta()",
+            "{",
+            "    return uint4(CollectMeta[0], CollectMeta[1], CollectMeta[2], CollectMeta[3]);",
+            "}",
+            "",
             "[numthreads(64, 1, 1)]",
             "void main(uint3 tid : SV_DispatchThreadID)",
             "{",
-            "    uint expected_start = CollectMeta[0];",
-            "    uint expected_count = CollectMeta[1];",
-            "    uint global_bone_base = CollectMeta[2];",
-            "    uint bone_count = CollectMeta[3];",
+            "    uint4 meta = LoadCollectMeta();",
+            "    uint expected_start = meta.x;",
+            "    uint expected_count = meta.y;",
+            "    uint global_bone_base = meta.z;",
+            "    uint bone_count = meta.w;",
             "    if (!CurrentCB0Matches(expected_start, expected_count))",
             "    {",
             "        return;",
@@ -556,7 +563,7 @@ def _prepare_loop_tangent_frames(
             mesh.free_tangents()
 
 
-def _numeric_vertex_group_names(obj: bpy.types.Object) -> dict[int, int]:
+def _numeric_vertex_group_ids(obj: bpy.types.Object) -> dict[int, int]:
     numeric_groups: dict[int, int] = {}
     for vertex_group in obj.vertex_groups:
         if vertex_group.name.isdigit():
@@ -564,13 +571,25 @@ def _numeric_vertex_group_names(obj: bpy.types.Object) -> dict[int, int]:
     return numeric_groups
 
 
+def _used_numeric_bone_ids(obj: bpy.types.Object) -> set[int]:
+    numeric_groups = _numeric_vertex_group_ids(obj)
+    used: set[int] = set()
+    for vertex in obj.data.vertices:
+        for group_ref in vertex.groups:
+            bone_id = numeric_groups.get(group_ref.group)
+            if bone_id is not None and float(group_ref.weight) > 0.0:
+                used.add(bone_id)
+    return used
+
+
 def _normalized_top4_weights(
     obj: bpy.types.Object,
     *,
     mesh: bpy.types.Mesh | None = None,
+    bone_to_local: dict[int, int] | None = None,
 ) -> tuple[list[tuple[int, int, int, int]], list[tuple[int, int, int, int]], int]:
     mesh = mesh or obj.data
-    numeric_groups = _numeric_vertex_group_names(obj)
+    numeric_groups = _numeric_vertex_group_ids(obj)
     if not numeric_groups:
         raise ValueError(f"{obj.name}: no numeric vertex groups were found")
 
@@ -581,13 +600,14 @@ def _normalized_top4_weights(
     for vertex in mesh.vertices:
         weighted_groups: list[tuple[int, float]] = []
         for group_ref in vertex.groups:
-            palette_index = numeric_groups.get(group_ref.group)
-            if palette_index is None:
+            bone_id = numeric_groups.get(group_ref.group)
+            if bone_id is None:
                 continue
+            palette_index = bone_to_local[bone_id] if bone_to_local is not None else bone_id
             if palette_index < 0 or palette_index > 0xFF:
                 raise ValueError(
                     f"{obj.name}: vertex group {palette_index} cannot be written to uint8 BLENDINDICES. "
-                    "Export the localized Bone Merge build copy or split the chunk to <= 256 local bones."
+                    "Split the export IB so this chunk uses <= 256 local bones."
                 )
             weighted_groups.append((palette_index, float(group_ref.weight)))
             max_palette_index = max(max_palette_index, palette_index)
@@ -640,6 +660,7 @@ def _extract_object_payload(
     obj: bpy.types.Object,
     *,
     flip_uv_v: bool = False,
+    bone_to_local: dict[int, int] | None = None,
     fallback_profile_id: str | None = None,
     fallback_original_first_index: int | None = None,
     fallback_original_index_count: int | None = None,
@@ -661,23 +682,24 @@ def _extract_object_payload(
     depsgraph = bpy.context.evaluated_depsgraph_get()
     missing_optional_attributes: list[str] = []
     mesh_copy, baked_shape_keys = _triangulated_mesh_copy(obj, depsgraph=depsgraph)
-    blend_indices, blend_weights, local_palette_count = _normalized_top4_weights(obj, mesh=mesh_copy)
-    uv0_layer = _find_uv_layer(mesh_copy, "UV0") or mesh_copy.uv_layers.active
+    blend_indices, blend_weights, local_palette_count = _normalized_top4_weights(
+        obj,
+        mesh=mesh_copy,
+        bone_to_local=bone_to_local,
+    )
+    uv0_layer = mesh_copy.uv_layers.active or _find_uv_layer(mesh_copy, "UV0")
     if uv0_layer is None:
         bpy.data.meshes.remove(mesh_copy)
-        raise ValueError(f"{obj.name}: UV0 or an active UV layer is required for export")
-    uv1_layer = _find_uv_layer(mesh_copy, "UV1", "packed_uv1")
-    uv2_layer = _find_uv_layer(mesh_copy, "UV2", "packed_uv2")
-    uv3_layer = _find_uv_layer(mesh_copy, "UV3", "packed_uv3")
-    packed_uv1, missing_uv1_attr = _optional_point_vector_attribute(mesh_copy, "packed_uv1")
+        raise ValueError(f"{obj.name}: an active UV layer is required for export")
+    uv1_layer = _find_uv_layer(mesh_copy, "UV1")
+    uv3_layer = _find_uv_layer(mesh_copy, "UV3", "packed_uv2")
+    uv4_layer = _find_uv_layer(mesh_copy, "UV4", "packed_uv3")
     packed_uv2, missing_uv2_attr = _optional_point_vector_attribute(mesh_copy, "packed_uv2")
     packed_uv3, missing_uv3_attr = _optional_point_vector_attribute(mesh_copy, "packed_uv3")
-    if uv1_layer is None and missing_uv1_attr:
-        missing_optional_attributes.append("packed_uv1")
-    if uv2_layer is None and missing_uv2_attr:
-        missing_optional_attributes.append("packed_uv2")
-    if uv3_layer is None and missing_uv3_attr:
-        missing_optional_attributes.append("packed_uv3")
+    if uv3_layer is None and missing_uv2_attr:
+        missing_optional_attributes.append("UV3_or_packed_uv2_defaulted")
+    if uv4_layer is None and missing_uv3_attr:
+        missing_optional_attributes.append("UV4_or_packed_uv3_defaulted")
     loop_frames = _prepare_loop_tangent_frames(mesh_copy, uv_layer_name=uv0_layer.name)
     if loop_frames is None:
         missing_optional_attributes.append("rebuild_tangent_frame_failed")
@@ -719,9 +741,11 @@ def _extract_object_payload(
             for loop_index in polygon.loop_indices:
                 source_vertex_index = mesh_copy.loops[loop_index].vertex_index
                 uv0 = _to_game_uv_pair(tuple(float(value) for value in uv0_layer.data[loop_index].uv))
-                uv1 = _to_game_uv_pair(_loop_uv_pair(loop_index, source_vertex_index, uv1_layer, packed_uv1))
-                uv2 = _to_game_uv_pair(_loop_uv_pair(loop_index, source_vertex_index, uv2_layer, packed_uv2))
-                uv3 = _to_game_uv_pair(_loop_uv_pair(loop_index, source_vertex_index, uv3_layer, packed_uv3))
+                uv1 = uv0 if uv1_layer is None else _to_game_uv_pair(
+                    tuple(float(value) for value in uv1_layer.data[loop_index].uv)
+                )
+                uv2 = _to_game_uv_pair(_loop_uv_pair(loop_index, source_vertex_index, uv3_layer, packed_uv2))
+                uv3 = _to_game_uv_pair(_loop_uv_pair(loop_index, source_vertex_index, uv4_layer, packed_uv3))
                 if loop_frames is not None:
                     loop_tangents, loop_normals, loop_signs = loop_frames
                     decoded_tangent = loop_tangents[loop_index]
@@ -1078,28 +1102,19 @@ def _resolve_export_parts(
     parts: list[dict[str, object]] = []
     seen_objects: dict[str, str] = {}
     used_part_indices: set[int] = set()
-    for child in child_collections:
-        nested_meshes = [
-            obj.name
-            for nested in child.children
-            for obj in nested.all_objects
-            if obj.type == "MESH"
-        ]
-        if nested_meshes:
-            raise ValueError(
-                f"Part collection '{child.name}' cannot contain nested mesh collections. "
-                f"Move meshes directly into the part: {', '.join(nested_meshes[:6])}"
-            )
 
-        mesh_objects = _sorted_mesh_objects(child.objects)
-        if not mesh_objects:
-            continue
-        part_index = _part_collection_index(child)
+    def append_part_definition(
+        *,
+        part_collection: bpy.types.Collection,
+        mesh_objects: list[bpy.types.Object],
+        part_index: int,
+        part_name: str,
+    ):
         if part_index in used_part_indices:
-            raise ValueError(f"Region '{region_hash}' has duplicate part index {part_index}.")
+            raise ValueError(f"Region '{region_hash}' has duplicate export part index {part_index}.")
         used_part_indices.add(part_index)
         bmc_ib_hash, bmc_match_index_count, bmc_chunk_index, bmc_identity_source = _part_bmc_identity(
-            child,
+            part_collection,
             region_hash=region_hash,
             region_index_count=region_index_count,
             part_index=part_index,
@@ -1109,14 +1124,14 @@ def _resolve_export_parts(
             if previous_part is not None:
                 raise ValueError(
                     f"{obj.name}: object is linked into multiple export parts "
-                    f"('{previous_part}' and '{child.name}')."
+                    f"('{previous_part}' and '{part_collection.name}')."
                 )
-            seen_objects[obj.name] = child.name
+            seen_objects[obj.name] = part_collection.name
         parts.append(
             {
                 "part_index": part_index,
-                "part_name": f"{region_part_prefix}_part{part_index:02d}",
-                "collection_name": child.name,
+                "part_name": part_name,
+                "collection_name": part_collection.name,
                 "objects": mesh_objects,
                 "implicit": False,
                 "bmc_ib_hash": bmc_ib_hash,
@@ -1124,6 +1139,43 @@ def _resolve_export_parts(
                 "bmc_chunk_index": bmc_chunk_index,
                 "bmc_identity_source": bmc_identity_source,
             }
+        )
+
+    for child in child_collections:
+        direct_part_meshes = _sorted_mesh_objects(child.objects)
+        nested_export_collections = [
+            nested
+            for nested in sorted(child.children, key=lambda item: item.name)
+            if _sorted_mesh_objects(nested.objects)
+        ]
+        if direct_part_meshes and nested_export_collections:
+            raise ValueError(
+                f"Part collection '{child.name}' mixes direct meshes and IB sub-collections. "
+                "Move all meshes into sub-collections or keep them all directly in the part."
+            )
+
+        parent_part_index = _part_collection_index(child)
+        if nested_export_collections:
+            for split_index, nested in enumerate(nested_export_collections):
+                mesh_objects = _sorted_mesh_objects(nested.objects)
+                export_part_index = _optional_int_collection_prop(nested, _PART_INDEX_PROP)
+                if export_part_index is None:
+                    export_part_index = (parent_part_index + 1) * 1000 + split_index
+                append_part_definition(
+                    part_collection=nested,
+                    mesh_objects=mesh_objects,
+                    part_index=export_part_index,
+                    part_name=f"{region_part_prefix}_part{parent_part_index:02d}_ib{split_index:02d}",
+                )
+            continue
+
+        if not direct_part_meshes:
+            continue
+        append_part_definition(
+            part_collection=child,
+            mesh_objects=direct_part_meshes,
+            part_index=parent_part_index,
+            part_name=f"{region_part_prefix}_part{parent_part_index:02d}",
         )
     if not parts:
         raise ValueError(f"Region collection '{root_collection.name}' has no non-empty part collections.")
@@ -1159,17 +1211,27 @@ def _remove_legacy_runtime_buffers(buffer_dir: Path):
                 buffer_path.unlink()
 
 
-def _palette_entry_count(buffer_dir: Path, palette_file: str, *, part_name: str) -> int:
-    palette_path = buffer_dir / palette_file
-    if not palette_path.is_file():
+def _build_part_palette(mesh_objects: list[bpy.types.Object], *, part_name: str) -> tuple[list[int], dict[int, int]]:
+    global_bone_ids: set[int] = set()
+    for obj in mesh_objects:
+        object_bones = _used_numeric_bone_ids(obj)
+        if len(object_bones) > 0x100:
+            raise ValueError(
+                f"{obj.name}: uses {len(object_bones)} numeric vertex groups, exceeding the uint8 BLENDINDICES limit. "
+                "Split this object before export; the first bridge pass does not cut one object by triangles."
+            )
+        global_bone_ids.update(object_bones)
+
+    if not global_bone_ids:
+        raise ValueError(f"{part_name}: no numeric vertex groups were found in this export IB.")
+    if len(global_bone_ids) > 0x100:
         raise ValueError(
-            f"{part_name}: missing bone palette '{palette_path}'. "
-            "Generate/copy the matching *-Palette.buf from 3dmigoto_bone_merge before exporting this package."
+            f"{part_name}: objects in this export IB use {len(global_bone_ids)} unique bones. "
+            "Run the collection split tool so each IB sub-collection uses <= 256 bones."
         )
-    byte_size = palette_path.stat().st_size
-    if byte_size <= 0 or byte_size % 4 != 0:
-        raise ValueError(f"{part_name}: palette file size must be a non-empty multiple of 4 bytes: {palette_path}")
-    return byte_size // 4
+
+    palette = sorted(global_bone_ids)
+    return palette, {global_bone_id: local_index for local_index, global_bone_id in enumerate(palette)}
 
 
 def _most_common_int(values: list[int]) -> int | None:
@@ -1235,6 +1297,7 @@ def _export_part_buffers(
     if not bmc_match_index_count:
         raise ValueError(f"{part_name}: cannot resolve the BMC palette match_index_count.")
     bmc_palette_file = f"{bmc_ib_hash}-{bmc_match_index_count}-{bmc_chunk_index}-Palette.buf"
+    palette_entries, bone_to_local = _build_part_palette(mesh_objects, part_name=part_name)
 
     all_positions: list[tuple[float, float, float]] = []
     all_indices: list[int] = []
@@ -1252,6 +1315,7 @@ def _export_part_buffers(
         payload = _extract_object_payload(
             obj,
             flip_uv_v=flip_uv_v,
+            bone_to_local=bone_to_local,
             fallback_profile_id=str(region_runtime_contract.get("profile_id") or ""),
             fallback_original_first_index=region_first_index,
             fallback_original_index_count=region_index_count,
@@ -1338,7 +1402,7 @@ def _export_part_buffers(
     if not all_indices:
         raise ValueError(f"Export part '{part_name}' produced no indices.")
 
-    palette_entry_count = _palette_entry_count(buffer_dir, bmc_palette_file, part_name=part_name)
+    palette_entry_count = len(palette_entries)
     if required_local_palette_count > palette_entry_count:
         raise ValueError(
             f"{part_name}: exported vertex groups require {required_local_palette_count} local bones, "
@@ -1360,6 +1424,7 @@ def _export_part_buffers(
     write_snorm8x4_pairs_buffer(str(buffer_dir / files["frame_pre_cs"]), all_frame_a, all_frame_b)
     write_half2x4_buffer(str(buffer_dir / files["packed_uv"]), all_packed_uv_entries)
     write_u32_buffer(str(buffer_dir / files["skin_cb0"]), [0, vertex_cursor, 0, palette_entry_count])
+    write_u32_buffer(str(buffer_dir / bmc_palette_file), palette_entries)
 
     return {
         "part_index": int(part_definition["part_index"]),
@@ -1378,7 +1443,7 @@ def _export_part_buffers(
         "last_cs_cb0_hash": str(region_runtime_contract.get("last_cs_cb0_hash") or ""),
         "last_cs_hash": str(region_runtime_contract.get("last_cs_hash") or ""),
         "expected_palette_file": bmc_palette_file,
-        "expected_palette_provider": "3dmigoto_bone_merge",
+        "expected_palette_provider": "exported_vertex_groups",
         "bmc_resource_suffix": f"{bmc_ib_hash}_{bmc_match_index_count}_{bmc_chunk_index}",
         "bmc_chunk_collection_name": f"{bmc_ib_hash}-{int(bmc_match_index_count)}-{bmc_chunk_index}",
         "bmc_identity_source": bmc_identity_source,
@@ -2065,27 +2130,32 @@ def export_collection_package(
     export_dir: str,
     frame_dump_dir: str | None = None,
     flip_uv_v: bool = False,
+    generate_ini: bool = True,
 ) -> dict[str, object]:
     """Export one strict sourceIB -> region -> part collection tree into runtime replacement assets."""
     collection = _get_collection(collection_name)
     export_root = _ensure_directory(Path(export_dir).resolve())
     buffer_dir = _ensure_directory(export_root / "Buffer")
     source_ib_hash = _source_root_hash(collection)
-    capture_ranges = _try_load_yihuan_capture_ranges(
-        export_root,
-        source_ib_hash,
-        frame_dump_dir=frame_dump_dir,
-    )
-    runtime_skin_enabled = bool(capture_ranges)
-    hlsl_dir = export_profile_hlsl_assets(YIHUAN_PROFILE.profile_id, export_root)
-    _remove_legacy_manifest_files(export_root)
+    capture_ranges: list[dict[str, object]] = []
+    runtime_skin_enabled = False
+    hlsl_dir: Path | None = None
+    if generate_ini:
+        capture_ranges = _try_load_yihuan_capture_ranges(
+            export_root,
+            source_ib_hash,
+            frame_dump_dir=frame_dump_dir,
+        )
+        runtime_skin_enabled = bool(capture_ranges)
+        hlsl_dir = export_profile_hlsl_assets(YIHUAN_PROFILE.profile_id, export_root)
+        _remove_legacy_manifest_files(export_root)
     _remove_legacy_runtime_buffers(buffer_dir)
 
     legacy_runtime_ini = export_root / f"{source_ib_hash}-runtime.ini"
-    if legacy_runtime_ini.is_file():
+    if generate_ini and legacy_runtime_ini.is_file():
         legacy_runtime_ini.unlink()
     bonestore_ini = export_root / f"{source_ib_hash}-BoneStore.ini"
-    if bonestore_ini.is_file() and not runtime_skin_enabled:
+    if generate_ini and bonestore_ini.is_file() and not runtime_skin_enabled:
         bonestore_ini.unlink()
     region_collections = _resolve_region_collections(collection)
     region_packages = [
@@ -2098,25 +2168,27 @@ def export_collection_package(
         )
         for region_collection in region_collections
     ]
-    if capture_ranges:
+    if generate_ini and capture_ranges:
         _apply_capture_stage_hashes(region_packages, capture_ranges)
+        assert hlsl_dir is not None
         _write_yihuan_collect_t0_hlsl(hlsl_dir=hlsl_dir, capture_ranges=capture_ranges)
 
-    ini_name = f"{source_ib_hash}.ini"
-    ini_file = _write_yihuan_main_ini(
-        export_root=export_root,
-        ini_name=ini_name,
-        region_packages=region_packages,
-        include_runtime_skin=runtime_skin_enabled,
-    )
+    ini_file: Path | None = None
     runtime_ini_file: Path | None = None
-    if runtime_skin_enabled:
-        runtime_ini_file = _write_yihuan_runtime_ini(
+    if generate_ini:
+        ini_file = _write_yihuan_main_ini(
             export_root=export_root,
-            ini_name=f"{source_ib_hash}-BoneStore.ini",
+            ini_name=f"{source_ib_hash}.ini",
             region_packages=region_packages,
-            capture_ranges=capture_ranges,
+            include_runtime_skin=runtime_skin_enabled,
         )
+        if runtime_skin_enabled:
+            runtime_ini_file = _write_yihuan_runtime_ini(
+                export_root=export_root,
+                ini_name=f"{source_ib_hash}-BoneStore.ini",
+                region_packages=region_packages,
+                capture_ranges=capture_ranges,
+            )
 
     total_vertices = sum(int(part["vertex_count"]) for package in region_packages for part in package["parts"])
     total_indices = sum(int(part["index_count"]) for package in region_packages for part in package["parts"])
@@ -2135,7 +2207,7 @@ def export_collection_package(
         "draw_count": total_draws,
         "part_count": total_parts,
         "buffer_dir": str(buffer_dir),
-        "hlsl_dir": str(hlsl_dir),
-        "ini_path": str(ini_file),
+        "hlsl_dir": "" if hlsl_dir is None else str(hlsl_dir),
+        "ini_path": "" if ini_file is None else str(ini_file),
         "runtime_ini_path": str(runtime_ini_file) if runtime_ini_file is not None else "",
     }

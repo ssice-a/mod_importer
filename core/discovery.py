@@ -295,6 +295,79 @@ def _draw_stage(record: _ResolvedDrawRecord) -> str:
     return ""
 
 
+def analyze_yihuan_frame_stages(frame_dump_dir: str | None, ib_hash: str | None = None) -> dict[str, object]:
+    """Return a compact, UI-friendly FrameAnalysis stage report for the Yihuan profile."""
+    scan_result = _scan_yihuan_frame_dump(frame_dump_dir)
+    requested_hash = _normalize_hash(ib_hash)
+    if requested_hash:
+        raw_ib_hash = scan_result.display_to_raw_ib.get(requested_hash, requested_hash)
+        draw_records = [record for record in scan_result.draw_records if record.raw_ib_hash == raw_ib_hash]
+    else:
+        raw_ib_hash = scan_result.raw_ib_hashes[0] if len(scan_result.raw_ib_hashes) == 1 else ""
+        draw_records = list(scan_result.draw_records if not raw_ib_hash else [
+            record for record in scan_result.draw_records if record.raw_ib_hash == raw_ib_hash
+        ])
+
+    stage_bases = {
+        "depth": 4100,
+        "gbuffer": 4200,
+        "unknown": 4900,
+    }
+    stage_next = dict(stage_bases)
+    shader_to_filter: dict[tuple[str, str], int] = {}
+    draw_rows: list[dict[str, object]] = []
+    for record in sorted(draw_records, key=lambda item: item.event_index):
+        stage = _draw_stage(record) or "unknown"
+        shader_key = (stage, record.vs_hash or "")
+        if shader_key not in shader_to_filter:
+            shader_to_filter[shader_key] = stage_next[stage]
+            stage_next[stage] += 1
+        draw_rows.append(
+            {
+                "event_index": record.event_index,
+                "stage": stage,
+                "filter_index": shader_to_filter[shader_key],
+                "raw_ib_hash": record.raw_ib_hash,
+                "display_ib_hash": record.display_ib_hash or "",
+                "first_index": record.first_index,
+                "index_count": record.index_count,
+                "base_vertex": record.base_vertex,
+                "vs_hash": record.vs_hash or "",
+                "ps_hash": record.ps_hash or "",
+                "vb0_hash": record.vb0_hash or "",
+                "resource_labels": list(record.vs_resource_labels),
+            }
+        )
+
+    dispatch_rows: list[dict[str, object]] = []
+    for event_index, record in sorted(scan_result.dispatch_records.items()):
+        cb0_hash = _artifact_hash(record.resources, "cb0") or ""
+        dispatch_rows.append(
+            {
+                "event_index": event_index,
+                "filter_index": 3300 if record.cs_hash == _PRIMARY_CS_HASH else 3301 if record.cs_hash == _LAST_CS_HASH else 3399,
+                "cs_hash": record.cs_hash or "",
+                "cb0_hash": cb0_hash,
+                "thread_group_count": [
+                    int(record.thread_group_count_x or 0),
+                    int(record.thread_group_count_y or 0),
+                    int(record.thread_group_count_z or 0),
+                ],
+                "resource_labels": sorted(record.resources.keys()),
+            }
+        )
+
+    return {
+        "profile_id": YIHUAN_PROFILE.profile_id,
+        "frame_dump_dir": scan_result.frame_dump_dir,
+        "raw_ib_hash": raw_ib_hash,
+        "draw_count": len(draw_rows),
+        "dispatch_count": len(dispatch_rows),
+        "draws": draw_rows,
+        "dispatches": dispatch_rows,
+    }
+
+
 @lru_cache(maxsize=64)
 def _cached_index_slice(slice_path: str):
     return read_index_slice_txt(slice_path)

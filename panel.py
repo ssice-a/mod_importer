@@ -23,6 +23,9 @@ class VIEW3D_PT_mod_importer(bpy.types.Panel):
         profile_box.prop(scene, "modimp_frame_dump_dir")
         profile_box.prop(scene, "modimp_ib_hash")
         profile_box.operator("modimp.resolve_from_ib_hash", icon="FILE_REFRESH")
+        profile_box.operator("modimp.analyze_frame_stages", icon="VIEWZOOM")
+        if scene.modimp_frame_analysis_summary:
+            profile_box.label(text=scene.modimp_frame_analysis_summary)
 
         resolved_box = layout.box()
         resolved_box.label(text="Resolved", icon="INFO")
@@ -56,9 +59,10 @@ class VIEW3D_PT_mod_importer(bpy.types.Panel):
             buffers_box.label(text=scene.modimp_root_vb0_note)
 
         import_box = layout.box()
-        import_box.label(text="Import", icon="IMPORT")
+        import_box.label(text="Collection / Import", icon="IMPORT")
+        import_box.prop(scene, "modimp_collection_name")
+        import_box.operator("modimp.create_export_collection", icon="OUTLINER_COLLECTION")
         import_box.prop(scene, "modimp_object_prefix")
-        import_box.prop(scene, "modimp_import_collection_name")
         import_box.prop(scene, "modimp_use_pre_cs_source")
         import_box.prop(scene, "modimp_flip_v")
         import_box.prop(scene, "modimp_shade_smooth")
@@ -69,9 +73,19 @@ class VIEW3D_PT_mod_importer(bpy.types.Panel):
 
         export_box = layout.box()
         export_box.label(text="Export", icon="EXPORT")
-        export_box.prop(scene, "modimp_export_collection_name")
-        export_box.operator("modimp.create_export_collection", icon="OUTLINER_COLLECTION")
         export_box.operator("modimp.create_export_part", icon="GROUP")
+        export_box.operator("modimp.split_export_parts", icon="MOD_ARRAY")
+
+        bone_box = export_box.box()
+        bone_box.label(text="Export Bone Groups", icon="GROUP_BONE")
+        bone_box.operator("modimp.rename_vertex_groups_from_palette", icon="SORTBYEXT")
+        bone_box.operator("modimp.restore_vertex_group_names", icon="LOOP_BACK")
+
+        outline_box = export_box.box()
+        outline_box.label(text="Outline / Rim Export", icon="LIGHT")
+        outline_box.label(text="Uses profile defaults, object attrs, or vertex color data")
+
         export_box.prop(scene, "modimp_export_dir")
+        export_box.prop(scene, "modimp_export_mode")
         export_box.operator("modimp.export_collection_buffers", icon="PACKAGE")
         export_box.operator("modimp.import_exported_package", icon="IMPORT")

@@ -7,7 +7,8 @@
 //   cb0 = original skin dispatch params
 //   t0  = original local T0 palette for that dispatch
 // Expected bindings set by the INI:
-//   t2  = uint collect meta: expected_start expected_count global_bone_base bone_count
+//   t2  = collect meta buffer, four uints:
+//         expected_start expected_count global_bone_base bone_count
 //   u0  = global T0 store UAV
 // =========================================================
 
@@ -27,13 +28,19 @@ bool CurrentCB0Matches(uint expected_start, uint expected_count)
     return primary_form || final_form;
 }
 
+uint4 LoadCollectMeta()
+{
+    return uint4(CollectMeta[0], CollectMeta[1], CollectMeta[2], CollectMeta[3]);
+}
+
 [numthreads(64, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID)
 {
-    uint expected_start = CollectMeta[0];
-    uint expected_count = CollectMeta[1];
-    uint global_bone_base = CollectMeta[2];
-    uint bone_count = CollectMeta[3];
+    uint4 meta = LoadCollectMeta();
+    uint expected_start = meta.x;
+    uint expected_count = meta.y;
+    uint global_bone_base = meta.z;
+    uint bone_count = meta.w;
     if (!CurrentCB0Matches(expected_start, expected_count))
     {
         return;
