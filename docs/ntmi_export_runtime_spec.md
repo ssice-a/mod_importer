@@ -167,6 +167,8 @@ dispatch = $vertex_count/64+1, 1, 1
 run = CustomShaderSkinFromBoundSlots
 ```
 
+当前 Core 只需要 `Shaders/SkinFromAtlasBoundSlots.hlsl`。旧的 local T0 两段式 shader 不再属于有效运行链路，插件也不应生成或引用它们。
+
 调用方必须绑定：
 
 ```ini
@@ -214,9 +216,10 @@ Mods/<mod_name>/<source_ib_hash>.ini
 2. 全局骨骼池工作资源。
 3. 每个 part 的静态资源。
 4. 每个 part 的动态输出资源。
-5. Collector。
-6. Collector post skin CommandList。
-7. Draw replacement TextureOverride。
+5. 每个 part 的 palette 资源段。
+6. Collector。
+7. Collector post skin CommandList。
+8. Draw replacement TextureOverride。
 
 当前模板采用扁平化写法：每个角色只保留一个 `CommandList_SkinParts_<ib_hash>`，按 part 顺序绑定 palette、输入、输出并调用 `CommandList\NTMIv1\SkinFromBoundSlots`。不要再为每个 part 生成额外 skin wrapper：
 
@@ -226,7 +229,7 @@ cs-t64 = ResourceRuntimeGlobalT0
 
 ; part 52407_0
 $\NTMIv1\vertex_count = 11370
-cs-t65 = Resource\Data_4c512c5c\Palette_4c512c5c_52407_0_part00
+cs-t65 = ResourcePalette_4c512c5c_52407_0_part00
 cs-t1 = ResourcePart_4c512c5c_52407_0_part00_BlendTyped
 cs-t2 = ResourcePart_4c512c5c_52407_0_part00_F33Frame
 cs-t3 = ResourcePart_4c512c5c_52407_0_part00_F33Position
@@ -239,7 +242,7 @@ ResourcePart_4c512c5c_52407_0_part00_RuntimeSkinnedNormal = copy ResourcePart_4c
 
 ; part 62346_52407
 $\NTMIv1\vertex_count = 18606
-cs-t65 = Resource\Data_4c512c5c\Palette_4c512c5c_62346_52407_part00
+cs-t65 = ResourcePalette_4c512c5c_62346_52407_part00
 cs-t1 = ResourcePart_4c512c5c_62346_52407_part00_BlendTyped
 cs-t2 = ResourcePart_4c512c5c_62346_52407_part00_F33Frame
 cs-t3 = ResourcePart_4c512c5c_62346_52407_part00_F33Position
@@ -253,19 +256,11 @@ ResourcePart_4c512c5c_62346_52407_part00_RuntimeSkinnedNormal = copy ResourcePar
 
 后续如果源码支持 UAV 输出直接作为 Buffer/VB/SRV 视图使用，可以再减少 publish copy；当前工具先按上面写法生成。
 
-### Data INI
+### Palette 资源段
 
-Data INI 只放静态表，建议命名：
-
-```text
-Mods/<mod_name>/<source_ib_hash>-Data.ini
-```
-
-当前只需要 palette：
+palette 直接写在主 INI 中：
 
 ```ini
-namespace = Data_4c512c5c
-
 [ResourcePalette_4c512c5c_52407_0_part00]
 type = Buffer
 format = R32_UINT
@@ -287,7 +282,7 @@ filename = Buffer/4c512c5c-62346-0-Palette.buf
 
 | 文件 | Resource 类型 | 格式 | 数量规则 |
 | --- | --- | --- | --- |
-| `*-ib.buf` | IB | `DXGI_FORMAT_R16_UINT` | index count 个 uint16 |
+| `*-ib.buf` | IB | `DXGI_FORMAT_R16_UINT` 或 `DXGI_FORMAT_R32_UINT` | index count 个 uint16/uint32 |
 | `*-position.buf` | Position / F33Position / PositionVB | `R32_FLOAT` 或 `stride = 12` | `vertex_count * 3` 个 float |
 | `*-blend.buf` | BlendTyped | `R32_UINT` | `vertex_count * 2` 个 uint |
 | `*-normal.buf` | F33Frame / Normal | `R8G8B8A8_SNORM` | `vertex_count * 2` 个 row |
@@ -297,9 +292,9 @@ filename = Buffer/4c512c5c-62346-0-Palette.buf
 
 当前导出限制：
 
-- 单个导出 IB 使用 `R16_UINT`，顶点数必须小于等于 65535。
+- 默认优先使用 `R16_UINT`；当最大索引超过 65535 时切换到 `R32_UINT`，不再因为顶点数超过 65535 强制拆分。
 - 单个 part 的 local bone index 仍是 8-bit，local palette 不能超过 256。
-- 超出限制时工具应拆 part 或报错，不要静默生成错误数据。
+- local palette 超过 256 时仍应拆 part 或报错，不要静默生成错误数据。
 
 ### 动态输出资源大小
 
@@ -377,7 +372,7 @@ FrameAnalysis/导入阶段至少要保存：
 
 - 每个 part 的 `vertex_count` 与 position、blend、frame、texcoord、outline 数据长度一致。
 - IB 最大索引小于该 part 的 `vertex_count`。
-- R16 IB 模式下 `vertex_count <= 65535`。
+- IB 格式必须覆盖最大索引：`max_index <= 65535` 时用 `R16_UINT`，否则用 `R32_UINT`。
 - 每个顶点 blend 正好 4 个 index + 4 个 weight，权重可归一化到 0..255。
 - local bone index 范围小于 palette 长度，且 palette 长度小于等于 256。
 - palette 中的 global bone index 小于 Collector build 后的全局骨骼数。
@@ -405,12 +400,6 @@ ResourcePart_4c512c5c_62346_52407_part00_BlendTyped
 ResourcePart_4c512c5c_62346_52407_part00_RuntimeSkinnedPositionVB
 ```
 
-Data namespace：
-
-```ini
-namespace = Data_<ib_hash>
-```
-
 Core namespace 固定：
 
 ```ini
@@ -435,7 +424,7 @@ namespace = NTMIv1
 2. 从 Blender 导出每个 part 的静态 mesh buffer。
 3. 根据顶点组生成 per-part local palette，并把 blend local bone index 重排到该 palette。
 4. 生成主 INI 资源段和动态资源段。
-5. 生成 Data INI palette 资源段。
+5. 在主 INI 内生成 palette 资源段。
 6. 生成 Collector。
 7. 生成 Collector post skin CommandList。
 8. 生成 TextureOverride draw replacement。

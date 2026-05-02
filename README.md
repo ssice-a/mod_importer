@@ -1,27 +1,26 @@
 # Mod Importer
 
-这是一个按“单集合桥梁”工作的 Blender 插件。当前主目标是异环 Profile，并以当前手写的 `83527398.ini` 与 `83527398-BoneStore.ini` 架构为准。
+这是一个面向改版 3DMigoto NTMI fast path 的 Blender 导入导出插件。当前实现目标是生成与 `E:\yh\Mods\bohe` 示例包一致的资源结构，而不是兼容旧 `BoneStore / PoseSlot / ShaderOverride` 架构。
 
-## 当前流程
+## 当前基准
 
-1. 在 `FrameAnalysis/Profile` 中分析帧分析目录，生成 stage map、CS collect map、draw pass map 和 BoneMergeMap。
-2. 插件只维护一个工作集合：`modimp_collection_name`。导入、外部模型分配、拆分和导出都围绕这一个集合进行。
-3. 把模型放进集合树：`source_ib_hash / region_hash-index_count-first_index / partXX / optional partXX_ibYY / mesh objects`。
-4. 对外部插件导入的模型，先执行 `Apply BoneMergeMap To Groups`，把局部顶点组编号转换成 BoneStore 全局骨骼编号。
-5. 导出时每个 IB 子集合独立生成 IB、position、blend、normal/frame、texcoord 和 per-IB palette。
-6. 默认可以只导出 buf；可选生成与当前手写 INI 对齐的 INI/BoneStore 资源。
+- 运行时规范：`docs/ntmi_export_runtime_spec.md`
+- 插件重构计划：`docs/ntmi_plugin_refactor_plan.md`
+- 示例包：`E:\yh\Mods\bohe`
+- 公共 Core：`E:\yh\Core\NTMI`
 
-## 重要约定
+## 目标流程
 
-- 导入和导出不耦合：导入只把可读 mesh 带进 Blender；导出只读取集合树与集合属性。
-- 不再支持旧的导入集合/导出集合双轨，也不再支持导入已导出的旧包。
-- 顶点组工具只读当前集合绑定的 BoneMergeMap，不再从外部 palette 文件推断。
-- 缺少 stage map、BoneMergeMap 或关键集合属性时直接报错，不猜测。
-- PS 材质槽位不由插件强行管理；用户可以基于生成模板或手写 INI 继续配置。
+1. 用 FrameAnalysis/Profile 分析目标角色，生成 draw region、Collector、VS/PS 资源槽位、BoneMergeMap。
+2. 在 Blender 中使用单一工作集合承载导出语义；外部插件导入的模型也先放进这个集合。
+3. 顶点组可直接使用全局骨骼编号；需要时用 BoneMergeMap 工具批量转换。
+4. 导出每个 part 的 IB、position、blend、normal/frame、texcoord、outline、palette。
+5. 可选生成 NTMI fast path INI：Collector + `CommandList_SkinParts_*` + DrawIndexed fast TextureOverride。
 
-## 导出限制
+## 关键约束
 
-- 单个导出 IB 使用 `R16_UINT`，顶点数不能超过 65535。
-- 单个导出 IB 的 local palette 不能超过 256 根骨骼。
-- 单个物体自身超过 65535 顶点或 256 根骨骼时，第一版只报错，不自动按三角面切碎。
-- 法线、tangent、UV 和权重会从导出临时 mesh 重新打包，不会破坏用户真实网格数据。
+- 性能第一：不生成全局 ShaderRegex，不生成 `ShaderOverride + checktextureoverride = ib`。
+- 可复用第二：蒙皮只调用 `E:\yh\Core\NTMI`，插件不再复制角色专属 HLSL。
+- 整洁第三：不保留旧包兼容路径；旧逻辑该删就删。
+- IB 根据最大索引自动选择 `R16_UINT` 或 `R32_UINT`。
+- 单个导出 part 的 local palette 仍不能超过 256。
