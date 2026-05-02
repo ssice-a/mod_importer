@@ -18,7 +18,7 @@ class VIEW3D_PT_mod_importer(bpy.types.Panel):
         scene = context.scene
 
         profile_box = layout.box()
-        profile_box.label(text="Profile", icon="TOOL_SETTINGS")
+        profile_box.label(text="FrameAnalysis / Profile", icon="TOOL_SETTINGS")
         profile_box.prop(scene, "modimp_profile")
         profile_box.prop(scene, "modimp_frame_dump_dir")
         profile_box.prop(scene, "modimp_ib_hash")
@@ -27,36 +27,33 @@ class VIEW3D_PT_mod_importer(bpy.types.Panel):
         if scene.modimp_frame_analysis_summary:
             profile_box.label(text=scene.modimp_frame_analysis_summary)
 
-        resolved_box = layout.box()
-        resolved_box.label(text="Resolved", icon="INFO")
         if scene.modimp_detected_model_name:
-            resolved_box.label(text=f"Model: {scene.modimp_detected_model_name}")
-            resolved_box.label(text=f"Slices: {scene.modimp_detected_slice_count}")
+            profile_box.separator()
+            profile_box.label(text=f"Model: {scene.modimp_detected_model_name}")
+            profile_box.label(text=f"Slices: {scene.modimp_detected_slice_count}")
         if scene.modimp_resolved_ib_hash:
-            resolved_box.label(text=f"IB: {scene.modimp_resolved_ib_hash}")
+            profile_box.label(text=f"IB: {scene.modimp_resolved_ib_hash}")
         if scene.modimp_resolved_display_ib_hash:
-            resolved_box.label(text=f"Display: {scene.modimp_resolved_display_ib_hash}")
+            profile_box.label(text=f"Display: {scene.modimp_resolved_display_ib_hash}")
         if scene.modimp_resolved_index_count:
-            resolved_box.label(
+            profile_box.label(
                 text=f"Slice: first={scene.modimp_resolved_first_index} count={scene.modimp_resolved_index_count}"
             )
         if scene.modimp_last_cs_hash:
-            resolved_box.label(text=f"Last CS Hash: {scene.modimp_last_cs_hash}")
+            profile_box.label(text=f"Last CS Hash: {scene.modimp_last_cs_hash}")
         if scene.modimp_last_cs_cb0_hash:
-            resolved_box.label(text=f"Last CS CB0 Hash: {scene.modimp_last_cs_cb0_hash}")
+            profile_box.label(text=f"Last CS CB0 Hash: {scene.modimp_last_cs_cb0_hash}")
         if scene.modimp_producer_t0_hash:
-            resolved_box.label(text=f"Producer T0 Hash: {scene.modimp_producer_t0_hash}")
+            profile_box.label(text=f"Producer T0 Hash: {scene.modimp_producer_t0_hash}")
 
-        buffers_box = layout.box()
-        buffers_box.label(text="Resolved Buffers", icon="FILE_FOLDER")
-        buffers_box.prop(scene, "modimp_pre_cs_vb0_path")
-        buffers_box.prop(scene, "modimp_post_cs_vb0_path")
-        buffers_box.prop(scene, "modimp_t5_buf_path")
-        buffers_box.prop(scene, "modimp_pre_cs_weight_path")
-        buffers_box.prop(scene, "modimp_pre_cs_frame_path")
-        buffers_box.prop(scene, "modimp_root_vb0_path")
+        profile_box.prop(scene, "modimp_pre_cs_vb0_path")
+        profile_box.prop(scene, "modimp_post_cs_vb0_path")
+        profile_box.prop(scene, "modimp_t5_buf_path")
+        profile_box.prop(scene, "modimp_pre_cs_weight_path")
+        profile_box.prop(scene, "modimp_pre_cs_frame_path")
+        profile_box.prop(scene, "modimp_root_vb0_path")
         if scene.modimp_root_vb0_note:
-            buffers_box.label(text=scene.modimp_root_vb0_note)
+            profile_box.label(text=scene.modimp_root_vb0_note)
 
         import_box = layout.box()
         import_box.label(text="Collection / Import", icon="IMPORT")
@@ -78,7 +75,7 @@ class VIEW3D_PT_mod_importer(bpy.types.Panel):
 
         bone_box = export_box.box()
         bone_box.label(text="Export Bone Groups", icon="GROUP_BONE")
-        bone_box.operator("modimp.rename_vertex_groups_from_palette", icon="SORTBYEXT")
+        bone_box.operator("modimp.apply_bone_merge_map_to_groups", icon="SORTBYEXT")
         bone_box.operator("modimp.restore_vertex_group_names", icon="LOOP_BACK")
 
         outline_box = export_box.box()
@@ -88,4 +85,3 @@ class VIEW3D_PT_mod_importer(bpy.types.Panel):
         export_box.prop(scene, "modimp_export_dir")
         export_box.prop(scene, "modimp_export_mode")
         export_box.operator("modimp.export_collection_buffers", icon="PACKAGE")
-        export_box.operator("modimp.import_exported_package", icon="IMPORT")

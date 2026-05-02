@@ -5,18 +5,15 @@ from __future__ import annotations
 from pathlib import Path
 import json
 import re
-import struct
 
 import bpy
 
 from .core.discovery import analyze_yihuan_frame_stages, discover_yihuan_model, resolve_yihuan_bundle_from_ib_hash
 from .core.exporter import export_collection_package
-from .core.importer import import_detected_model, import_exported_package
+from .core.importer import import_detected_model
 from .core.profiles import YIHUAN_PROFILE, get_profile
 
 
-_LEGACY_IMPORT_COLLECTION_NAME = "Mod Importer Imports"
-_LEGACY_EXPORT_COLLECTION_NAME = "Mod Importer Export"
 _HASH8_RE = re.compile(r"^[0-9A-Fa-f]{8}$")
 _OBJECT_HASH_PREFIX_RE = re.compile(r"^(?P<hash>[0-9A-Fa-f]{8})(?:[-_](?P<count>\d+)(?:[-_](?P<first>\d+))?)?")
 _COLLECTION_KIND_PROP = "modimp_kind"
@@ -37,10 +34,16 @@ _GBUFFER_VS_HASHES_PROP = "modimp_gbuffer_vs_hashes"
 _BMC_IB_HASH_PROP = "modimp_bmc_ib_hash"
 _BMC_MATCH_INDEX_COUNT_PROP = "modimp_bmc_match_index_count"
 _BMC_CHUNK_INDEX_PROP = "modimp_bmc_chunk_index"
-_LEGACY_ORIGINAL_VERTEX_GROUP_NAMES_PROP = "modimp_original_vertex_group_names"
-_PRE_CONVERSION_VERTEX_GROUP_NAMES_PROP = "modimp_pre_conversion_vertex_group_names"
+_BONE_MERGE_MAP_TEXT_PROP = "modimp_bone_merge_map_text"
+_STAGE_MAP_TEXT_PROP = "modimp_stage_map_text"
+_CS_COLLECT_MAP_TEXT_PROP = "modimp_cs_collect_map_text"
+_DRAW_PASS_MAP_TEXT_PROP = "modimp_draw_pass_map_text"
+_EXPORT_ROOT_COLLECTION_PROP = "modimp_export_root_collection"
+_PRE_BONE_MERGE_VERTEX_GROUP_NAMES_PROP = "modimp_pre_bone_merge_vertex_group_names"
+_BONE_MERGE_APPLIED_PROP = "modimp_bone_merge_groups_applied"
 _EXPORT_SPLIT_INDEX_PROP = "modimp_export_split_index"
 _EXPORT_SPLIT_PARENT_PROP = "modimp_export_split_parent"
+_EXPORT_ROOT_KIND = "export_root"
 _IB_SUBPART_KIND = "ib_part"
 _REGION_RUNTIME_PROPS = (
     _PRODUCER_CS_HASH_PROP,
@@ -57,73 +60,18 @@ def _ensure_supported_profile(scene: bpy.types.Scene):
     return profile
 
 
-def _legacy_model_name(ib_hash: str) -> str:
-    return f"{YIHUAN_PROFILE.profile_id}_ib_{ib_hash}"
-
-
-def _should_replace_collection_name(value: str, ib_hash: str) -> bool:
-    normalized = value.strip().lower()
-    legacy_model_name = _legacy_model_name(ib_hash).lower()
-    legacy_import_name = _LEGACY_IMPORT_COLLECTION_NAME.lower()
-    legacy_export_name = _LEGACY_EXPORT_COLLECTION_NAME.lower()
-    return normalized in {
-        "",
-        legacy_import_name,
-        legacy_export_name,
-        f"{legacy_import_name} export",
-        f"{legacy_export_name} export",
-        ib_hash.lower(),
-        legacy_model_name,
-        f"{legacy_model_name} export",
-        f"{ib_hash.lower()} export",
-    }
-
-
 def _set_scene_collection_name(scene: bpy.types.Scene, collection_name: str):
-    normalized = collection_name.strip()
-    scene.modimp_collection_name = normalized
-    scene.modimp_import_collection_name = normalized
-    scene.modimp_export_collection_name = normalized
+    scene.modimp_collection_name = collection_name.strip()
 
 
 def _scene_collection_name(scene: bpy.types.Scene) -> str:
-    for value in (
-        scene.modimp_collection_name,
-        scene.modimp_export_collection_name,
-        scene.modimp_import_collection_name,
-    ):
-        normalized = value.strip()
-        if normalized:
-            _set_scene_collection_name(scene, normalized)
-            return normalized
-    return ""
-
-
-def _scene_collection_candidates(scene: bpy.types.Scene) -> tuple[str, ...]:
-    candidates: list[str] = []
-    for value in (
-        scene.modimp_collection_name,
-        scene.modimp_export_collection_name,
-        scene.modimp_import_collection_name,
-        scene.modimp_resolved_ib_hash,
-    ):
-        normalized = value.strip().lower()
-        if normalized and normalized not in candidates:
-            candidates.append(normalized)
-    return tuple(candidates)
+    return scene.modimp_collection_name.strip()
 
 
 def _apply_ib_collection_defaults(scene: bpy.types.Scene, ib_hash: str, export_hash: str | None = None):
     del export_hash
-    preferred_collection = ib_hash.strip()
-    if _should_replace_collection_name(_scene_collection_name(scene), ib_hash):
-        _set_scene_collection_name(scene, preferred_collection)
-
-
-def _clear_legacy_object_prefix(scene: bpy.types.Scene, ib_hash: str):
-    normalized_prefix = scene.modimp_object_prefix.strip().lower()
-    if normalized_prefix in {_legacy_model_name(ib_hash).lower(), ib_hash.lower()}:
-        scene.modimp_object_prefix = ""
+    if not _scene_collection_name(scene):
+        _set_scene_collection_name(scene, ib_hash)
 
 
 def _optional_int_prop(owner, key: str) -> int | None:
@@ -265,7 +213,6 @@ def _apply_detected_model_to_scene(scene: bpy.types.Scene, detected_model):
     scene.modimp_root_vb0_path = detected_model.vb0_origin_trace.closest_rest_pose_path
     scene.modimp_root_vb0_note = detected_model.vb0_origin_trace.note
     _apply_ib_collection_defaults(scene, detected_model.ib_hash)
-    _clear_legacy_object_prefix(scene, detected_model.ib_hash)
 
 
 def _apply_resolved_bundle_to_scene(scene: bpy.types.Scene, resolved_bundle):
@@ -291,7 +238,6 @@ def _apply_resolved_bundle_to_scene(scene: bpy.types.Scene, resolved_bundle):
         resolved_bundle.ib_hash,
         resolved_bundle.selected_slice.display_ib_hash or resolved_bundle.ib_hash,
     )
-    _clear_legacy_object_prefix(scene, resolved_bundle.ib_hash)
 
 
 def _ensure_scene_collection_linked(
@@ -319,6 +265,59 @@ def _mark_source_collection(collection: bpy.types.Collection, source_ib_hash: st
     collection[_COLLECTION_KIND_PROP] = "source_ib"
     collection[_PROFILE_ID_PROP] = YIHUAN_PROFILE.profile_id
     collection[_SOURCE_IB_HASH_PROP] = source_ib_hash.lower()
+
+
+def _export_root_name(source_ib_hash: str) -> str:
+    return f"{source_ib_hash.lower()}_Export"
+
+
+def _mark_export_root_collection(collection: bpy.types.Collection, source_ib_hash: str):
+    collection[_COLLECTION_KIND_PROP] = _EXPORT_ROOT_KIND
+    collection[_PROFILE_ID_PROP] = YIHUAN_PROFILE.profile_id
+    collection[_SOURCE_IB_HASH_PROP] = source_ib_hash.lower()
+
+
+def _ensure_export_root_collection(
+    scene: bpy.types.Scene,
+    working_collection: bpy.types.Collection,
+    source_ib_hash: str,
+) -> bpy.types.Collection:
+    export_root = bpy.data.collections.get(_export_root_name(source_ib_hash))
+    if export_root is None:
+        export_root = bpy.data.collections.new(_export_root_name(source_ib_hash))
+    if export_root.name not in working_collection.children.keys():
+        working_collection.children.link(export_root)
+    _mark_export_root_collection(export_root, source_ib_hash)
+    working_collection[_EXPORT_ROOT_COLLECTION_PROP] = export_root.name
+    _set_scene_collection_name(scene, working_collection.name)
+    return export_root
+
+
+def _find_export_root_collection(working_collection: bpy.types.Collection) -> bpy.types.Collection | None:
+    if _optional_str_prop(working_collection, _COLLECTION_KIND_PROP) == _EXPORT_ROOT_KIND:
+        return working_collection
+    stored_name = _optional_str_prop(working_collection, _EXPORT_ROOT_COLLECTION_PROP)
+    if stored_name:
+        stored_collection = bpy.data.collections.get(stored_name)
+        if stored_collection is not None:
+            return stored_collection
+    source_hash = _optional_str_prop(working_collection, _SOURCE_IB_HASH_PROP) or working_collection.name
+    named_collection = bpy.data.collections.get(_export_root_name(source_hash))
+    if named_collection is not None:
+        return named_collection
+    return None
+
+
+def _copy_export_text_props(source: bpy.types.Collection, target: bpy.types.Collection):
+    for key in (
+        _BONE_MERGE_MAP_TEXT_PROP,
+        _STAGE_MAP_TEXT_PROP,
+        _CS_COLLECT_MAP_TEXT_PROP,
+        _DRAW_PASS_MAP_TEXT_PROP,
+    ):
+        value = _optional_str_prop(source, key)
+        if value:
+            target[key] = value
 
 
 def _mark_region_collection(
@@ -399,6 +398,30 @@ def _region_collection_name(region_hash: str, index_count: int | None, first_ind
     if index_count is not None:
         return f"{region_hash}-{int(index_count)}"
     return region_hash
+
+
+def _ensure_export_region_collection_for_object(
+    export_root: bpy.types.Collection,
+    obj: bpy.types.Object,
+    *,
+    source_ib_hash: str,
+    link_object: bool,
+) -> bpy.types.Collection:
+    region_hash, index_count, first_index = _object_region_identity(obj)
+    if not region_hash:
+        raise ValueError(f"{obj.name}: cannot resolve local/region hash for export submesh collection.")
+    region_collection = _ensure_child_collection(export_root, obj.name)
+    _mark_region_collection(
+        region_collection,
+        source_ib_hash=source_ib_hash,
+        region_hash=region_hash,
+        index_count=index_count,
+        first_index=first_index,
+        runtime_contract=_object_runtime_contract(obj),
+    )
+    if link_object and obj.name not in region_collection.objects.keys():
+        region_collection.objects.link(obj)
+    return region_collection
 
 
 def _collection_region_identity(collection: bpy.types.Collection) -> tuple[str, int | None, int | None]:
@@ -564,43 +587,69 @@ def _used_numeric_vertex_group_ids(obj: bpy.types.Object) -> set[int]:
     return used
 
 
-def _record_original_vertex_group_names(obj: bpy.types.Object):
-    if _PRE_CONVERSION_VERTEX_GROUP_NAMES_PROP in obj:
+def _record_pre_bone_merge_vertex_group_names(obj: bpy.types.Object):
+    if _PRE_BONE_MERGE_VERTEX_GROUP_NAMES_PROP in obj:
         return
-    obj[_PRE_CONVERSION_VERTEX_GROUP_NAMES_PROP] = json.dumps(
+    obj[_PRE_BONE_MERGE_VERTEX_GROUP_NAMES_PROP] = json.dumps(
         [vertex_group.name for vertex_group in obj.vertex_groups],
-        ensure_ascii=True,
+        ensure_ascii=False,
     )
 
 
-def _read_u32_palette(path: Path) -> list[int]:
-    data = path.read_bytes()
-    if not data or len(data) % 4 != 0:
-        raise ValueError(f"Palette file must be a non-empty uint32 buffer: {path}")
-    return [value[0] for value in struct.iter_unpack("<I", data)]
+def _working_collection(scene: bpy.types.Scene) -> bpy.types.Collection:
+    collection_name = _scene_collection_name(scene)
+    if not collection_name:
+        raise ValueError("Fill Collection first.")
+    collection = bpy.data.collections.get(collection_name)
+    if collection is None:
+        raise ValueError(f"Collection does not exist: {collection_name}")
+    return collection
+
+
+def _export_root_for_scene(scene: bpy.types.Scene, *, create: bool = False) -> bpy.types.Collection:
+    working_collection = _working_collection(scene)
+    source_ib_hash = _optional_str_prop(working_collection, _SOURCE_IB_HASH_PROP) or working_collection.name
+    if not _HASH8_RE.fullmatch(source_ib_hash):
+        raise ValueError("Collection must be the source IB hash, for example 83527398.")
+    export_root = _find_export_root_collection(working_collection)
+    if export_root is None and create:
+        export_root = _ensure_export_root_collection(scene, working_collection, source_ib_hash)
+    if export_root is None:
+        raise ValueError(f"Export logic root does not exist. Click Create Collection to create {_export_root_name(source_ib_hash)}.")
+    _mark_export_root_collection(export_root, source_ib_hash)
+    _copy_export_text_props(working_collection, export_root)
+    return export_root
 
 
 def _find_export_collection_for_object(obj: bpy.types.Object) -> bpy.types.Collection | None:
     for collection in obj.users_collection:
-        if _optional_str_prop(collection, _COLLECTION_KIND_PROP) in {"part", _IB_SUBPART_KIND}:
+        if _optional_str_prop(collection, _COLLECTION_KIND_PROP) in {"region", "part", _IB_SUBPART_KIND}:
             return collection
     return None
 
 
-def _palette_path_for_object(scene: bpy.types.Scene, obj: bpy.types.Object) -> Path:
-    collection = _find_export_collection_for_object(obj)
-    if collection is None:
-        raise ValueError(f"{obj.name}: object is not linked directly to an export part or IB sub-collection.")
-    bmc_ib_hash = _optional_str_prop(collection, _BMC_IB_HASH_PROP)
-    bmc_match_index_count = _optional_int_prop(collection, _BMC_MATCH_INDEX_COUNT_PROP)
-    bmc_chunk_index = _optional_int_prop(collection, _BMC_CHUNK_INDEX_PROP)
-    if not bmc_ib_hash or bmc_match_index_count is None or bmc_chunk_index is None:
-        raise ValueError(f"{obj.name}: export collection '{collection.name}' has no BMC palette identity.")
-    return (
-        Path(scene.modimp_export_dir.strip())
-        / "Buffer"
-        / f"{bmc_ib_hash.lower()}-{int(bmc_match_index_count)}-{int(bmc_chunk_index)}-Palette.buf"
-    )
+def _write_text_json(text_name: str, payload: object) -> bpy.types.Text:
+    text = bpy.data.texts.get(text_name) or bpy.data.texts.new(text_name)
+    text.clear()
+    text.write(json.dumps(payload, indent=2, ensure_ascii=False))
+    return text
+
+
+def _read_text_json(text_name: str) -> object:
+    text = bpy.data.texts.get(text_name)
+    if text is None:
+        raise ValueError(f"Missing Blender text block: {text_name}")
+    return json.loads(text.as_string())
+
+
+def _bone_count_from_t0_path(t0_buf_path: str) -> int:
+    path = Path(str(t0_buf_path or ""))
+    if not path.is_file():
+        return 0
+    byte_size = path.stat().st_size
+    if byte_size <= 0 or byte_size % (16 * 3) != 0:
+        return 0
+    return byte_size // (16 * 3)
 
 
 def _rename_object_with_suffix(obj: bpy.types.Object, suffix: str):
@@ -693,6 +742,290 @@ def _partition_objects_by_limits(objects: list[bpy.types.Object]) -> list[list[b
     return buckets
 
 
+def _auto_split_export_root_by_limits(export_root: bpy.types.Collection) -> tuple[int, int, int]:
+    source_ib_hash = _optional_str_prop(export_root, _SOURCE_IB_HASH_PROP)
+    changed_parts = 0
+    created_children = 0
+    moved_objects = 0
+    for region_collection in sorted(export_root.children, key=lambda item: item.name):
+        region_hash, region_index_count, _first_index = _collection_region_identity(region_collection)
+        if not region_hash:
+            continue
+
+        direct_region_meshes = [obj for obj in region_collection.objects if obj.type == "MESH"]
+        if direct_region_meshes:
+            buckets = _partition_objects_by_limits(direct_region_meshes)
+            if len(buckets) > 1:
+                changed_parts += 1
+                part_collection = _ensure_part_collection(
+                    region_collection,
+                    source_ib_hash=source_ib_hash,
+                    region_hash=region_hash,
+                    part_index=0,
+                    region_index_count=region_index_count,
+                )
+                for split_index, bucket in enumerate(buckets):
+                    child = _make_ib_subcollection(
+                        part_collection,
+                        source_ib_hash=source_ib_hash,
+                        region_hash=region_hash,
+                        parent_part_index=0,
+                        region_index_count=region_index_count,
+                        split_index=split_index,
+                    )
+                    created_children += 1
+                    for obj in bucket:
+                        _move_object_within_export_tree(obj, export_root=export_root, target_collection=child)
+                        obj[_EXPORT_SPLIT_INDEX_PROP] = int(split_index)
+                        _rename_object_with_suffix(obj, f"__ib{split_index:02d}")
+                        moved_objects += 1
+
+        for part_collection in sorted(region_collection.children, key=lambda item: item.name):
+            parent_part_index = _part_collection_index(part_collection)
+            if parent_part_index is None:
+                continue
+            direct_meshes = [obj for obj in part_collection.objects if obj.type == "MESH"]
+            if not direct_meshes:
+                continue
+            buckets = _partition_objects_by_limits(direct_meshes)
+            if len(buckets) <= 1:
+                continue
+            changed_parts += 1
+            for split_index, bucket in enumerate(buckets):
+                child = _make_ib_subcollection(
+                    part_collection,
+                    source_ib_hash=source_ib_hash,
+                    region_hash=region_hash,
+                    parent_part_index=parent_part_index,
+                    region_index_count=region_index_count,
+                    split_index=split_index,
+                )
+                created_children += 1
+                for obj in bucket:
+                    _link_only_to_child_inside_part(
+                        obj,
+                        part_collection=part_collection,
+                        child_collection=child,
+                    )
+                    obj[_EXPORT_SPLIT_INDEX_PROP] = int(split_index)
+                    _rename_object_with_suffix(obj, f"__ib{split_index:02d}")
+                    moved_objects += 1
+    return changed_parts, created_children, moved_objects
+
+
+def _build_bone_merge_map(summary: dict[str, object], detected_model) -> dict[str, object]:
+    dispatches_by_event = {
+        int(dispatch["event_index"]): dispatch
+        for dispatch in summary.get("dispatches", [])
+        if isinstance(dispatch, dict)
+    }
+    global_bone_cursor = 0
+    entries: list[dict[str, object]] = []
+    dispatch_entries: list[dict[str, object]] = []
+
+    for detected_slice in sorted(
+        detected_model.slices,
+        key=lambda item: (
+            int(item.producer_dispatch_index or 0),
+            int(item.first_index),
+            int(item.index_count),
+        ),
+    ):
+        dispatch_index = detected_slice.producer_dispatch_index
+        if dispatch_index is None:
+            continue
+        dispatch = dispatches_by_event.get(int(dispatch_index), {})
+        bone_count = _bone_count_from_t0_path(str(dispatch.get("t0_buf_path", "")))
+        if bone_count <= 0:
+            continue
+
+        region_hash = str(detected_slice.display_ib_hash or detected_slice.raw_ib_hash or "").strip().lower()
+        if not _HASH8_RE.fullmatch(region_hash):
+            region_hash = str(detected_slice.raw_ib_hash or "").strip().lower()
+        if not _HASH8_RE.fullmatch(region_hash):
+            continue
+
+        producer_start_vertex = dispatch.get("start_vertex")
+        if producer_start_vertex is None:
+            producer_start_vertex = detected_slice.producer_start_vertex or 0
+        producer_vertex_count = dispatch.get("vertex_count")
+        if producer_vertex_count is None:
+            producer_vertex_count = detected_slice.producer_vertex_count or 0
+
+        dispatch_entry = {
+            "source_ib_hash": str(detected_model.ib_hash).lower(),
+            "region_hash": region_hash,
+            "first_index": int(detected_slice.first_index),
+            "index_count": int(detected_slice.index_count),
+            "used_vertex_start": int(detected_slice.used_vertex_start),
+            "used_vertex_end": int(detected_slice.used_vertex_end),
+            "producer_dispatch_index": int(dispatch_index),
+            "producer_start_vertex": int(producer_start_vertex or 0),
+            "producer_vertex_count": int(producer_vertex_count or 0),
+            "producer_cs_hash": str(detected_slice.producer_cs_hash or dispatch.get("cs_hash", "") or "").lower(),
+            "producer_t0_hash": str(detected_slice.producer_t0_hash or dispatch.get("t0_hash", "") or "").lower(),
+            "last_cs_hash": str(detected_slice.last_cs_hash or "").lower(),
+            "last_cs_cb0_hash": str(detected_slice.last_cs_cb0_hash or "").lower(),
+            "global_bone_base": int(global_bone_cursor),
+            "bone_count": int(bone_count),
+        }
+        dispatch_entries.append(dispatch_entry)
+        for local_bone_index in range(bone_count):
+            global_bone_index = global_bone_cursor + local_bone_index
+            entries.append(
+                {
+                    "source_ib_hash": str(detected_model.ib_hash).lower(),
+                    "region_hash": region_hash,
+                    "first_index": int(detected_slice.first_index),
+                    "index_count": int(detected_slice.index_count),
+                    "local_bone_index": int(local_bone_index),
+                    "global_bone_index": int(global_bone_index),
+                    "display_name": f"{region_hash}_bone_{local_bone_index:03d}",
+                }
+            )
+        global_bone_cursor += bone_count
+
+    return {
+        "profile_id": YIHUAN_PROFILE.profile_id,
+        "source_ib_hash": str(detected_model.ib_hash).lower(),
+        "global_bone_count": int(global_bone_cursor),
+        "dispatches": dispatch_entries,
+        "entries": entries,
+    }
+
+
+def _map_by_region_and_local(bone_merge_map: dict[str, object]) -> dict[tuple[str, int | None, int | None, int], int]:
+    lookup: dict[tuple[str, int | None, int | None, int], int] = {}
+    for raw_entry in bone_merge_map.get("entries", []):
+        if not isinstance(raw_entry, dict):
+            continue
+        region_hash = str(raw_entry.get("region_hash", "") or "").strip().lower()
+        local_bone_index = int(raw_entry["local_bone_index"])
+        global_bone_index = int(raw_entry["global_bone_index"])
+        first_index = raw_entry.get("first_index")
+        index_count = raw_entry.get("index_count")
+        lookup[(region_hash, int(first_index), int(index_count), local_bone_index)] = global_bone_index
+        lookup[(region_hash, None, None, local_bone_index)] = global_bone_index
+    return lookup
+
+
+def _bone_merge_text_name_for_collection(collection: bpy.types.Collection) -> str:
+    existing_name = _optional_str_prop(collection, _BONE_MERGE_MAP_TEXT_PROP)
+    if existing_name:
+        return existing_name
+    return "modimp_bone_merge_map.json"
+
+
+def _stage_text_names_for_collection(collection: bpy.types.Collection) -> dict[str, str]:
+    source_hash = _optional_str_prop(collection, _SOURCE_IB_HASH_PROP) or collection.name
+    safe_hash = source_hash.lower() if _HASH8_RE.fullmatch(source_hash.lower()) else "working"
+    return {
+        _STAGE_MAP_TEXT_PROP: f"modimp_{safe_hash}_stage_map.json",
+        _CS_COLLECT_MAP_TEXT_PROP: f"modimp_{safe_hash}_cs_collect_map.json",
+        _DRAW_PASS_MAP_TEXT_PROP: f"modimp_{safe_hash}_draw_pass_map.json",
+    }
+
+
+def _write_frame_analysis_maps_to_collection(
+    collection: bpy.types.Collection,
+    *,
+    source_ib_hash: str,
+    detected_model,
+    summary: dict[str, object],
+) -> dict[str, object]:
+    bone_merge_map = _build_bone_merge_map(summary, detected_model)
+    bone_merge_text = _write_text_json("modimp_bone_merge_map.json", bone_merge_map)
+    collection[_BONE_MERGE_MAP_TEXT_PROP] = bone_merge_text.name
+
+    text_names = _stage_text_names_for_collection(collection)
+    stage_text = _write_text_json(
+        text_names[_STAGE_MAP_TEXT_PROP],
+        {
+            "profile_id": YIHUAN_PROFILE.profile_id,
+            "source_ib_hash": source_ib_hash,
+            "stage_map": summary.get("stage_map", {}),
+            "stage_candidates": summary.get("stage_candidates", {}),
+            "draws": summary.get("draws", []),
+        },
+    )
+    cs_text = _write_text_json(
+        text_names[_CS_COLLECT_MAP_TEXT_PROP],
+        {
+            "profile_id": YIHUAN_PROFILE.profile_id,
+            "source_ib_hash": source_ib_hash,
+            "dispatches": bone_merge_map.get("dispatches", []),
+        },
+    )
+    draw_text = _write_text_json(
+        text_names[_DRAW_PASS_MAP_TEXT_PROP],
+        {
+            "profile_id": YIHUAN_PROFILE.profile_id,
+            "source_ib_hash": source_ib_hash,
+            "draws": summary.get("draws", []),
+        },
+    )
+    collection[_STAGE_MAP_TEXT_PROP] = stage_text.name
+    collection[_CS_COLLECT_MAP_TEXT_PROP] = cs_text.name
+    collection[_DRAW_PASS_MAP_TEXT_PROP] = draw_text.name
+    return bone_merge_map
+
+
+def _object_or_collection_region_identity(obj: bpy.types.Object) -> tuple[str, int | None, int | None]:
+    export_collection = _find_export_collection_for_object(obj)
+    if export_collection is not None:
+        region_hash, index_count, first_index = _collection_region_identity(export_collection)
+        if region_hash:
+            return region_hash, index_count, first_index
+    return _object_region_identity(obj)
+
+
+def _apply_bone_merge_map_to_objects(
+    objects: list[bpy.types.Object],
+    bone_merge_map: dict[str, object],
+    *,
+    skip_already_applied: bool = True,
+) -> int:
+    lookup = _map_by_region_and_local(bone_merge_map)
+    if not lookup:
+        raise ValueError("BoneMergeMap has no usable entries.")
+
+    renamed_count = 0
+    for obj in objects:
+        if skip_already_applied and bool(obj.get(_BONE_MERGE_APPLIED_PROP, False)):
+            continue
+        region_hash, index_count, first_index = _object_or_collection_region_identity(obj)
+        if not region_hash:
+            raise ValueError(f"{obj.name}: cannot resolve region identity for BoneMergeMap lookup.")
+
+        _record_pre_bone_merge_vertex_group_names(obj)
+        object_renamed = 0
+        for vertex_group in obj.vertex_groups:
+            if not vertex_group.name.isdigit():
+                continue
+            local_index = int(vertex_group.name)
+            global_index = lookup.get((region_hash, first_index, index_count, local_index))
+            if global_index is None:
+                global_index = lookup.get((region_hash, None, None, local_index))
+            if global_index is None:
+                raise ValueError(
+                    f"{obj.name}: BoneMergeMap has no entry for "
+                    f"{region_hash} first={first_index} count={index_count} local bone {local_index}."
+                )
+            global_name = str(int(global_index))
+            if vertex_group.name != global_name:
+                vertex_group.name = global_name
+                renamed_count += 1
+                object_renamed += 1
+        obj[_BONE_MERGE_APPLIED_PROP] = True
+        obj["modimp_bone_merge_region_hash"] = region_hash
+        if first_index is not None:
+            obj["modimp_bone_merge_first_index"] = int(first_index)
+        if index_count is not None:
+            obj["modimp_bone_merge_index_count"] = int(index_count)
+        obj["modimp_bone_merge_renamed_count"] = int(object_renamed)
+    return renamed_count
+
+
 class MODIMP_OT_resolve_from_ib_hash(bpy.types.Operator):
     """Resolve one model profile bundle from an IB hash."""
 
@@ -753,6 +1086,10 @@ class MODIMP_OT_import_resolved_model(bpy.types.Operator):
                 scene.modimp_frame_dump_dir.strip() or None,
                 ib_hash=scene.modimp_ib_hash.strip(),
             )
+            summary = analyze_yihuan_frame_stages(
+                scene.modimp_frame_dump_dir.strip() or None,
+                ib_hash=scene.modimp_ib_hash.strip(),
+            )
             resolved_bundle = resolve_yihuan_bundle_from_ib_hash(
                 scene.modimp_ib_hash.strip(),
                 frame_dump_dir=scene.modimp_frame_dump_dir.strip() or None,
@@ -776,6 +1113,24 @@ class MODIMP_OT_import_resolved_model(bpy.types.Operator):
                 apply_section_transform=scene.modimp_apply_section_transform,
                 use_pre_cs_source=scene.modimp_use_pre_cs_source,
             )
+            working_collection = _ensure_scene_collection_linked(scene, collection_name)
+            _mark_source_collection(working_collection, detected_model.ib_hash)
+            bone_merge_map = _write_frame_analysis_maps_to_collection(
+                working_collection,
+                source_ib_hash=detected_model.ib_hash,
+                detected_model=detected_model,
+                summary=summary,
+            )
+            renamed_groups = _apply_bone_merge_map_to_objects(imported_objects, bone_merge_map)
+            export_root = _ensure_export_root_collection(scene, working_collection, detected_model.ib_hash)
+            _copy_export_text_props(working_collection, export_root)
+            for imported_object in imported_objects:
+                _ensure_export_region_collection_for_object(
+                    export_root,
+                    imported_object,
+                    source_ib_hash=detected_model.ib_hash,
+                    link_object=False,
+                )
         except Exception as exc:  # pylint: disable=broad-except
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
@@ -786,18 +1141,18 @@ class MODIMP_OT_import_resolved_model(bpy.types.Operator):
                 f"Imported {import_stats['slice_count']} slices, "
                 f"{import_stats['vertex_count']} compacted verts, "
                 f"{import_stats['triangle_count']} tris into "
-                f"{scene.modimp_collection_name.strip()}."
+                f"{scene.modimp_collection_name.strip()}; converted {renamed_groups} vertex groups to BoneStore ids."
             ),
         )
         return {"FINISHED"}
 
 
 class MODIMP_OT_create_export_collection(bpy.types.Operator):
-    """Create the single source-IB collection tree and seed part00 from selected meshes."""
+    """Create the export logic root and one empty submesh collection per mesh."""
 
     bl_idname = "modimp.create_export_collection"
     bl_label = "Create Collection"
-    bl_description = "Create the source-IB working collection and region/part00 children for selected meshes"
+    bl_description = "Create the working collection plus an empty export logic root with per-submesh children"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -813,7 +1168,7 @@ class MODIMP_OT_create_export_collection(bpy.types.Operator):
             collection_name = (
                 scene.modimp_resolved_ib_hash.strip()
                 or selected_source_ib_hash
-                or _LEGACY_IMPORT_COLLECTION_NAME
+                or scene.modimp_ib_hash.strip()
             )
             _set_scene_collection_name(scene, collection_name)
 
@@ -827,7 +1182,7 @@ class MODIMP_OT_create_export_collection(bpy.types.Operator):
             for candidate in (
                 selected_source_ib_hash,
                 scene.modimp_resolved_ib_hash.strip().lower(),
-                *_scene_collection_candidates(scene),
+                scene.modimp_collection_name.strip().lower(),
             ):
                 if _HASH8_RE.fullmatch(candidate):
                     source_ib_hash = candidate
@@ -836,65 +1191,29 @@ class MODIMP_OT_create_export_collection(bpy.types.Operator):
             self.report({"ERROR"}, "Collection must be a source IB hash, for example 83527398.")
             return {"CANCELLED"}
 
-        export_collection = _ensure_scene_collection_linked(scene, source_ib_hash)
-        _set_scene_collection_name(scene, export_collection.name)
-        _mark_source_collection(export_collection, source_ib_hash)
-        frame_runtime_lookup = _build_frame_runtime_lookup(scene, source_ib_hash)
+        working_collection = _ensure_scene_collection_linked(scene, source_ib_hash)
+        _set_scene_collection_name(scene, working_collection.name)
+        _mark_source_collection(working_collection, source_ib_hash)
+        export_root = _ensure_export_root_collection(scene, working_collection, source_ib_hash)
+        _copy_export_text_props(working_collection, export_root)
 
-        grouped_objects: dict[tuple[str, int | None, int | None], list[bpy.types.Object]] = {}
-        for obj in selected_mesh_objects:
-            region_hash, index_count, first_index = _object_region_identity(obj)
-            if not region_hash:
-                self.report({"ERROR"}, f"{obj.name}: cannot resolve local/region hash for export part.")
-                return {"CANCELLED"}
-            grouped_objects.setdefault((region_hash, index_count, first_index), []).append(obj)
-
-        created_parts: list[str] = []
-        linked_count = 0
-        unlinked_count = 0
-        for (region_hash, index_count, first_index), objects in sorted(grouped_objects.items()):
-            region_collection_name = _region_collection_name(region_hash, index_count, first_index)
-            region_collection = _ensure_child_collection(export_collection, region_collection_name)
-            runtime_contract = _resolve_region_runtime_contract(
-                scene,
-                frame_runtime_lookup=frame_runtime_lookup,
-                region_hash=region_hash,
-                index_count=index_count,
-                first_index=first_index,
-                objects=objects,
-            )
-            _mark_region_collection(
-                region_collection,
+        seed_objects = selected_mesh_objects or [obj for obj in working_collection.objects if obj.type == "MESH"]
+        created_submeshes: list[str] = []
+        for obj in sorted(seed_objects, key=lambda item: item.name):
+            submesh_collection = _ensure_export_region_collection_for_object(
+                export_root,
+                obj,
                 source_ib_hash=source_ib_hash,
-                region_hash=region_hash,
-                index_count=index_count,
-                first_index=first_index,
-                runtime_contract=runtime_contract,
+                link_object=False,
             )
-            part_collection = _ensure_part_collection(
-                region_collection,
-                source_ib_hash=source_ib_hash,
-                region_hash=region_hash,
-                part_index=0,
-                region_index_count=index_count,
-            )
-            created_parts.append(f"{region_hash}/{part_collection.name}")
-            for obj in objects:
-                already_in_target = obj.name in part_collection.objects.keys()
-                unlinked_count += _move_object_within_export_tree(
-                    obj,
-                    export_root=export_collection,
-                    target_collection=part_collection,
-                )
-                if not already_in_target:
-                    linked_count += 1
+            created_submeshes.append(submesh_collection.name)
 
-        if not selected_mesh_objects:
+        if not seed_objects:
             self.report(
                 {"INFO"},
                 (
-                    f"Collection '{export_collection.name}' is ready. "
-                    "Select mesh objects and click Create Collection again to seed region/part00."
+                    f"Collection '{working_collection.name}' is ready. "
+                    f"Export logic root '{export_root.name}' is ready; no mesh objects were seeded."
                 ),
             )
             return {"FINISHED"}
@@ -902,9 +1221,9 @@ class MODIMP_OT_create_export_collection(bpy.types.Operator):
         self.report(
             {"INFO"},
             (
-                f"Collection '{export_collection.name}' is ready. "
-                f"Seeded {', '.join(created_parts)}; linked {linked_count} mesh objects, "
-                f"unlinked {unlinked_count} stale export-tree links."
+                f"Collection '{working_collection.name}' is ready. "
+                f"Export logic root '{export_root.name}' has {len(created_submeshes)} submesh collection(s). "
+                "Objects were not moved or linked into the export tree."
             ),
         )
         return {"FINISHED"}
@@ -929,7 +1248,7 @@ class MODIMP_OT_create_export_part(bpy.types.Operator):
 
         source_ib_hash = ""
         for candidate in (
-            *_scene_collection_candidates(scene),
+            scene.modimp_collection_name.strip().lower(),
             scene.modimp_resolved_ib_hash.strip().lower(),
             selected_source_ib_hash,
         ):
@@ -940,9 +1259,11 @@ class MODIMP_OT_create_export_part(bpy.types.Operator):
             self.report({"ERROR"}, "Cannot resolve source IB hash for Collection.")
             return {"CANCELLED"}
 
-        export_collection = _ensure_scene_collection_linked(scene, source_ib_hash)
-        _set_scene_collection_name(scene, export_collection.name)
-        _mark_source_collection(export_collection, source_ib_hash)
+        working_collection = _ensure_scene_collection_linked(scene, source_ib_hash)
+        _set_scene_collection_name(scene, working_collection.name)
+        _mark_source_collection(working_collection, source_ib_hash)
+        export_root = _ensure_export_root_collection(scene, working_collection, source_ib_hash)
+        _copy_export_text_props(working_collection, export_root)
         frame_runtime_lookup = _build_frame_runtime_lookup(scene, source_ib_hash)
 
         grouped_objects: dict[tuple[str, int | None, int | None], list[bpy.types.Object]] = {}
@@ -954,20 +1275,28 @@ class MODIMP_OT_create_export_part(bpy.types.Operator):
                     return {"CANCELLED"}
                 grouped_objects.setdefault((region_hash, index_count, first_index), []).append(obj)
         else:
-            fallback_region_hash = scene.modimp_resolved_display_ib_hash.strip().lower()
-            if not _HASH8_RE.fullmatch(fallback_region_hash):
+            target_region_hash = scene.modimp_resolved_display_ib_hash.strip().lower()
+            if not _HASH8_RE.fullmatch(target_region_hash):
                 self.report({"ERROR"}, "Select mesh objects or resolve a local/region hash before creating an empty part.")
                 return {"CANCELLED"}
             index_count = int(scene.modimp_resolved_index_count) if scene.modimp_resolved_index_count else None
             first_index = int(scene.modimp_resolved_first_index) if scene.modimp_resolved_first_index else None
-            grouped_objects[(fallback_region_hash, index_count, first_index)] = []
+            grouped_objects[(target_region_hash, index_count, first_index)] = []
 
         created_parts: list[str] = []
         linked_count = 0
         unlinked_count = 0
         for (region_hash, index_count, first_index), objects in sorted(grouped_objects.items()):
-            region_collection_name = _region_collection_name(region_hash, index_count, first_index)
-            region_collection = _ensure_child_collection(export_collection, region_collection_name)
+            if objects:
+                region_collection = _ensure_export_region_collection_for_object(
+                    export_root,
+                    objects[0],
+                    source_ib_hash=source_ib_hash,
+                    link_object=False,
+                )
+            else:
+                region_collection_name = _region_collection_name(region_hash, index_count, first_index)
+                region_collection = _ensure_child_collection(export_root, region_collection_name)
             runtime_contract = _resolve_region_runtime_contract(
                 scene,
                 frame_runtime_lookup=frame_runtime_lookup,
@@ -995,7 +1324,7 @@ class MODIMP_OT_create_export_part(bpy.types.Operator):
                 already_in_target = obj.name in part_collection.objects.keys()
                 unlinked_count += _move_object_within_export_tree(
                     obj,
-                    export_root=export_collection,
+                    export_root=export_root,
                     target_collection=part_collection,
                 )
                 if not already_in_target:
@@ -1005,7 +1334,7 @@ class MODIMP_OT_create_export_part(bpy.types.Operator):
             {"INFO"},
             (
                 f"Created export parts: {', '.join(created_parts)}. "
-                f"Linked {linked_count} mesh objects, unlinked {unlinked_count} stale export-tree links."
+                f"Linked {linked_count} mesh objects, unlinked {unlinked_count} stale collection-tree links."
             ),
         )
         return {"FINISHED"}
@@ -1026,6 +1355,10 @@ class MODIMP_OT_analyze_frame_stages(bpy.types.Operator):
             self.report({"ERROR"}, "Fill Frame Dump Dir first.")
             return {"CANCELLED"}
         try:
+            detected_model = discover_yihuan_model(
+                scene.modimp_frame_dump_dir.strip(),
+                ib_hash=scene.modimp_ib_hash.strip() or scene.modimp_resolved_ib_hash.strip() or None,
+            )
             summary = analyze_yihuan_frame_stages(
                 scene.modimp_frame_dump_dir.strip(),
                 ib_hash=scene.modimp_ib_hash.strip() or scene.modimp_resolved_ib_hash.strip() or None,
@@ -1037,25 +1370,38 @@ class MODIMP_OT_analyze_frame_stages(bpy.types.Operator):
         draw_count = int(summary["draw_count"])
         dispatch_count = int(summary["dispatch_count"])
         raw_ib_hash = str(summary.get("raw_ib_hash", ""))
-        scene.modimp_frame_analysis_summary = (
-            f"IB {raw_ib_hash or 'mixed'}: {draw_count} draws, {dispatch_count} dispatches"
+        source_ib_hash = str(raw_ib_hash or detected_model.ib_hash or scene.modimp_ib_hash).strip().lower()
+        collection = _ensure_scene_collection_linked(scene, source_ib_hash)
+        _set_scene_collection_name(scene, collection.name)
+        _mark_source_collection(collection, source_ib_hash)
+        export_root = _ensure_export_root_collection(scene, collection, source_ib_hash)
+
+        bone_merge_map = _write_frame_analysis_maps_to_collection(
+            collection,
+            source_ib_hash=source_ib_hash,
+            detected_model=detected_model,
+            summary=summary,
         )
-        text_name = "modimp_frame_analysis_report.json"
-        text = bpy.data.texts.get(text_name) or bpy.data.texts.new(text_name)
-        text.clear()
-        text.write(json.dumps(summary, indent=2, ensure_ascii=False))
-        self.report({"INFO"}, f"Analyzed FrameAnalysis: {scene.modimp_frame_analysis_summary}. See {text_name}.")
+        _copy_export_text_props(collection, export_root)
+
+        scene.modimp_frame_analysis_summary = (
+            f"IB {source_ib_hash or 'mixed'}: {draw_count} draws, {dispatch_count} dispatches, "
+            f"{len(bone_merge_map.get('entries', []))} bone map rows"
+        )
+        report_text = _write_text_json("modimp_frame_analysis_report.json", summary)
+        self.report(
+            {"INFO"},
+            f"Analyzed FrameAnalysis: {scene.modimp_frame_analysis_summary}. See {report_text.name}.",
+        )
         return {"FINISHED"}
 
 
-class MODIMP_OT_rename_vertex_groups_from_palette(bpy.types.Operator):
-    """Convert selected export objects' numeric local vertex groups to global bone ids."""
+class MODIMP_OT_apply_bone_merge_map_to_groups(bpy.types.Operator):
+    """Convert selected objects' numeric local vertex groups through the BoneMergeMap."""
 
-    bl_idname = "modimp.rename_vertex_groups_from_palette"
-    bl_label = "Convert Export Groups From Palette"
-    bl_description = (
-        "For selected export objects, rename numeric local vertex groups to global bone ids using their export palette"
-    )
+    bl_idname = "modimp.apply_bone_merge_map_to_groups"
+    bl_label = "Apply BoneMergeMap To Groups"
+    bl_description = "Rename selected objects' numeric local vertex groups to global BoneStore ids using the current collection BoneMergeMap"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -1065,45 +1411,26 @@ class MODIMP_OT_rename_vertex_groups_from_palette(bpy.types.Operator):
             self.report({"ERROR"}, "Select mesh objects first.")
             return {"CANCELLED"}
 
-        renamed_count = 0
-        missing_palettes: list[str] = []
         try:
-            for obj in selected_mesh_objects:
-                palette_path = _palette_path_for_object(scene, obj)
-                if not palette_path.is_file():
-                    missing_palettes.append(f"{obj.name}: {palette_path.name}")
-                    continue
-                palette = _read_u32_palette(palette_path)
-                _record_original_vertex_group_names(obj)
-                for vertex_group in obj.vertex_groups:
-                    if not vertex_group.name.isdigit():
-                        continue
-                    local_index = int(vertex_group.name)
-                    if local_index >= len(palette):
-                        raise ValueError(
-                            f"{obj.name}: vertex group {local_index} exceeds palette size {len(palette)} "
-                            f"from {palette_path.name}."
-                        )
-                    global_name = str(int(palette[local_index]))
-                    if vertex_group.name != global_name:
-                        vertex_group.name = global_name
-                        renamed_count += 1
+            collection = _working_collection(scene)
+            bone_merge_map = _read_text_json(_bone_merge_text_name_for_collection(collection))
+            if not isinstance(bone_merge_map, dict):
+                raise ValueError("BoneMergeMap text block must contain a JSON object.")
+            renamed_count = _apply_bone_merge_map_to_objects(selected_mesh_objects, bone_merge_map)
         except Exception as exc:  # pylint: disable=broad-except
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
 
-        if missing_palettes:
-            self.report({"WARNING"}, f"Skipped missing palettes: {', '.join(missing_palettes[:4])}")
-        self.report({"INFO"}, f"Renamed {renamed_count} vertex groups on {len(selected_mesh_objects)} object(s).")
+        self.report({"INFO"}, f"Applied BoneMergeMap to {renamed_count} vertex groups on {len(selected_mesh_objects)} object(s).")
         return {"FINISHED"}
 
 
 class MODIMP_OT_restore_vertex_group_names(bpy.types.Operator):
-    """Restore selected export objects' vertex group names saved before palette conversion."""
+    """Restore selected export objects' vertex group names saved before BoneMergeMap conversion."""
 
     bl_idname = "modimp.restore_vertex_group_names"
-    bl_label = "Restore Pre-Conversion Group Names"
-    bl_description = "Restore selected export objects' vertex group names saved before Convert Export Groups From Palette"
+    bl_label = "Restore Pre-BoneMerge Group Names"
+    bl_description = "Restore selected export objects' vertex group names saved before Apply BoneMergeMap To Groups"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -1115,9 +1442,7 @@ class MODIMP_OT_restore_vertex_group_names(bpy.types.Operator):
         restored = 0
         skipped: list[str] = []
         for obj in selected_mesh_objects:
-            raw_names = obj.get(_PRE_CONVERSION_VERTEX_GROUP_NAMES_PROP) or obj.get(
-                _LEGACY_ORIGINAL_VERTEX_GROUP_NAMES_PROP
-            )
+            raw_names = obj.get(_PRE_BONE_MERGE_VERTEX_GROUP_NAMES_PROP)
             if not raw_names:
                 skipped.append(obj.name)
                 continue
@@ -1130,15 +1455,12 @@ class MODIMP_OT_restore_vertex_group_names(bpy.types.Operator):
                 if vertex_group.name != str(original_name):
                     vertex_group.name = str(original_name)
                     restored += 1
-            for prop_name in (
-                _PRE_CONVERSION_VERTEX_GROUP_NAMES_PROP,
-                _LEGACY_ORIGINAL_VERTEX_GROUP_NAMES_PROP,
-            ):
-                if prop_name in obj:
-                    del obj[prop_name]
+            del obj[_PRE_BONE_MERGE_VERTEX_GROUP_NAMES_PROP]
+            if _BONE_MERGE_APPLIED_PROP in obj:
+                del obj[_BONE_MERGE_APPLIED_PROP]
 
         if skipped:
-            self.report({"WARNING"}, f"No pre-conversion group-name history on: {', '.join(skipped[:4])}")
+            self.report({"WARNING"}, f"No pre-BoneMerge group-name history on: {', '.join(skipped[:4])}")
         self.report({"INFO"}, f"Restored {restored} vertex group names.")
         return {"FINISHED"}
 
@@ -1153,53 +1475,13 @@ class MODIMP_OT_split_export_parts(bpy.types.Operator):
 
     def execute(self, context):
         scene = context.scene
-        source_ib_hash = _scene_collection_name(scene).strip().lower()
-        if not _HASH8_RE.fullmatch(source_ib_hash):
-            self.report({"ERROR"}, "Collection must be the source IB hash before splitting.")
-            return {"CANCELLED"}
-        export_collection = bpy.data.collections.get(source_ib_hash)
-        if export_collection is None:
-            self.report({"ERROR"}, f"Export collection does not exist: {source_ib_hash}")
-            return {"CANCELLED"}
-
-        changed_parts = 0
-        created_children = 0
-        moved_objects = 0
         try:
-            for region_collection in sorted(export_collection.children, key=lambda item: item.name):
-                region_hash, region_index_count, _first_index = _collection_region_identity(region_collection)
-                if not region_hash:
-                    continue
-                for part_collection in sorted(region_collection.children, key=lambda item: item.name):
-                    parent_part_index = _part_collection_index(part_collection)
-                    if parent_part_index is None:
-                        continue
-                    direct_meshes = [obj for obj in part_collection.objects if obj.type == "MESH"]
-                    if not direct_meshes:
-                        continue
-                    buckets = _partition_objects_by_limits(direct_meshes)
-                    if len(buckets) <= 1:
-                        continue
-                    changed_parts += 1
-                    for split_index, bucket in enumerate(buckets):
-                        child = _make_ib_subcollection(
-                            part_collection,
-                            source_ib_hash=source_ib_hash,
-                            region_hash=region_hash,
-                            parent_part_index=parent_part_index,
-                            region_index_count=region_index_count,
-                            split_index=split_index,
-                        )
-                        created_children += 1
-                        for obj in bucket:
-                            _link_only_to_child_inside_part(
-                                obj,
-                                part_collection=part_collection,
-                                child_collection=child,
-                            )
-                            obj[_EXPORT_SPLIT_INDEX_PROP] = int(split_index)
-                            _rename_object_with_suffix(obj, f"__ib{split_index:02d}")
-                            moved_objects += 1
+            export_root = _export_root_for_scene(scene)
+        except Exception as exc:  # pylint: disable=broad-except
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        try:
+            changed_parts, created_children, moved_objects = _auto_split_export_root_by_limits(export_root)
         except Exception as exc:  # pylint: disable=broad-except
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
@@ -1216,125 +1498,66 @@ class MODIMP_OT_split_export_parts(bpy.types.Operator):
 
 def _sync_export_collection_metadata(context) -> tuple[int, int, list[str]]:
     scene = context.scene
-
-    source_ib_hash = ""
-    for candidate in (
-        *_scene_collection_candidates(scene),
-        scene.modimp_resolved_ib_hash.strip().lower(),
-    ):
-        if _HASH8_RE.fullmatch(candidate):
-            source_ib_hash = candidate
-            break
-    if not source_ib_hash:
+    working_collection = _working_collection(scene)
+    source_ib_hash = _optional_str_prop(working_collection, _SOURCE_IB_HASH_PROP) or working_collection.name.lower()
+    if not _HASH8_RE.fullmatch(source_ib_hash):
         raise ValueError("Fill Collection with the source IB hash, for example 83527398.")
+    _mark_source_collection(working_collection, source_ib_hash)
+    export_collection = _export_root_for_scene(scene, create=True)
 
-    export_collection = bpy.data.collections.get(source_ib_hash)
-    if export_collection is None:
-        raise ValueError(f"Export collection does not exist: {source_ib_hash}")
-
-    _set_scene_collection_name(scene, export_collection.name)
-    _mark_source_collection(export_collection, source_ib_hash)
-
-    region_infos: list[tuple[bpy.types.Collection, str, int | None, int | None, list[bpy.types.Object]]] = []
+    region_infos: list[tuple[bpy.types.Collection, str, int | None, int | None]] = []
     for region_collection in sorted(export_collection.children, key=lambda item: item.name):
         region_hash, index_count, first_index = _collection_region_identity(region_collection)
         if not region_hash:
             continue
-        region_infos.append(
-            (
-                region_collection,
-                region_hash,
-                index_count,
-                first_index,
-                _mesh_objects_in_collection_tree(region_collection),
-            )
-        )
+        region_infos.append((region_collection, region_hash, index_count, first_index))
 
     if not region_infos:
-        raise ValueError(f"{source_ib_hash}: no region collections found under export root.")
+        raise ValueError(f"{source_ib_hash}: no region collections found under Collection.")
 
-    def apply_metadata(frame_runtime_lookup: dict[tuple[str, int, int], dict[str, object]]) -> tuple[int, list[str]]:
-        part_count = 0
-        missing_runtime: list[str] = []
-        for region_collection, region_hash, index_count, first_index, mesh_objects in region_infos:
-            runtime_contract = _resolve_region_runtime_contract(
-                scene,
-                frame_runtime_lookup=frame_runtime_lookup,
-                region_hash=region_hash,
-                index_count=index_count,
-                first_index=first_index,
-                objects=mesh_objects,
-            )
-            _mark_region_collection(
-                region_collection,
+    part_count = 0
+    missing_runtime: list[str] = []
+    for region_collection, region_hash, index_count, first_index in region_infos:
+        # 导出同步只维护集合树身份；runtime/hash 合同必须已经写在集合属性上。
+        _mark_region_collection(
+            region_collection,
+            source_ib_hash=source_ib_hash,
+            region_hash=region_hash,
+            index_count=index_count,
+            first_index=first_index,
+        )
+
+        missing_fields = _missing_region_contract_fields(
+            region_collection,
+            index_count=index_count,
+            first_index=first_index,
+        )
+        if missing_fields:
+            missing_runtime.append(region_collection.name)
+
+        if any(obj.type == "MESH" for obj in region_collection.objects):
+            part_count += 1
+        for part_collection in sorted(region_collection.children, key=lambda item: item.name):
+            part_index = _part_collection_index(part_collection)
+            if part_index is None:
+                continue
+            _mark_part_collection(
+                part_collection,
                 source_ib_hash=source_ib_hash,
                 region_hash=region_hash,
-                index_count=index_count,
-                first_index=first_index,
-                runtime_contract=runtime_contract,
+                part_index=part_index,
+                region_index_count=index_count,
             )
-
-            missing_fields = _missing_region_contract_fields(
-                region_collection,
-                index_count=index_count,
-                first_index=first_index,
-            )
-            if missing_fields:
-                missing_runtime.append(region_collection.name)
-
-            for part_collection in sorted(region_collection.children, key=lambda item: item.name):
-                part_index = _part_collection_index(part_collection)
-                if part_index is None:
-                    continue
-                _mark_part_collection(
-                    part_collection,
-                    source_ib_hash=source_ib_hash,
-                    region_hash=region_hash,
-                    part_index=part_index,
-                    region_index_count=index_count,
-                )
-                part_count += 1
-        return part_count, missing_runtime
-
-    part_count, missing_runtime = apply_metadata({})
-    if missing_runtime and scene.modimp_frame_dump_dir.strip():
-        part_count, missing_runtime = apply_metadata(_build_frame_runtime_lookup(scene, source_ib_hash))
+            part_count += 1
     return len(region_infos), part_count, missing_runtime
 
 
-def _resolve_export_package_hash(scene: bpy.types.Scene) -> str:
-    for candidate in (
-        *_scene_collection_candidates(scene),
-        scene.modimp_resolved_ib_hash.strip().lower(),
-    ):
-        if _HASH8_RE.fullmatch(candidate):
-            return candidate
-
-    export_dir = scene.modimp_export_dir.strip()
-    if export_dir:
-        export_root = Path(export_dir)
-        if export_root.is_dir():
-            ini_hashes = sorted(
-                {
-                    ini_path.stem.lower()
-                    for ini_path in export_root.glob("*.ini")
-                    if ini_path.is_file()
-                    and not ini_path.stem.lower().endswith("-bonestore")
-                    and _HASH8_RE.fullmatch(ini_path.stem)
-                }
-            )
-            if len(ini_hashes) == 1:
-                return ini_hashes[0]
-
-    raise ValueError("Cannot resolve exported package hash. Set Collection to the source IB hash, for example 83527398.")
-
-
 class MODIMP_OT_export_collection_buffers(bpy.types.Operator):
-    """Export the working collection into runtime buffers, INI, and referenced HLSL assets."""
+    """Export the working collection into game buffers and optional INI/HLSL assets."""
 
     bl_idname = "modimp.export_collection_buffers"
-    bl_label = "Export Package"
-    bl_description = "Rebuild runtime buffers, INI, and profile HLSL for the working collection"
+    bl_label = "Export Buffers"
+    bl_description = "Export game buffers and optionally generate INI/HLSL for the working collection"
     bl_options = {"REGISTER"}
 
     def execute(self, context):
@@ -1349,11 +1572,12 @@ class MODIMP_OT_export_collection_buffers(bpy.types.Operator):
             return {"CANCELLED"}
 
         try:
+            export_root = _export_root_for_scene(scene)
+            split_stats = _auto_split_export_root_by_limits(export_root)
             region_count, part_count, missing_runtime = _sync_export_collection_metadata(context)
             export_stats = export_collection_package(
-                collection_name=_scene_collection_name(scene),
+                collection_name=export_root.name,
                 export_dir=scene.modimp_export_dir.strip(),
-                frame_dump_dir=scene.modimp_frame_dump_dir.strip() or None,
                 flip_uv_v=scene.modimp_flip_v,
                 generate_ini=scene.modimp_export_mode == "BUFFERS_AND_INI",
             )
@@ -1369,54 +1593,12 @@ class MODIMP_OT_export_collection_buffers(bpy.types.Operator):
                 f"{export_stats['part_count']} parts / {export_stats['draw_count']} draws, "
                 f"{export_stats['vertex_count']} verts, "
                 f"{export_stats['triangle_count']} tris to {export_stats['buffer_dir']} "
-                f"({scene.modimp_export_mode})."
+                f"({scene.modimp_export_mode}); auto-split {split_stats[0]} collection(s)."
             ),
         )
         if missing_runtime:
             self.report(
                 {"WARNING"},
-                f"Runtime metadata was incomplete before export sync on: {', '.join(missing_runtime[:4])}.",
+                f"Collection export contract is incomplete on: {', '.join(missing_runtime[:4])}.",
             )
-        return {"FINISHED"}
-
-
-class MODIMP_OT_import_exported_package(bpy.types.Operator):
-    """Import the generated export package back into Blender for round-trip verification."""
-
-    bl_idname = "modimp.import_exported_package"
-    bl_label = "Import Exported Package"
-    bl_description = "Import the generated buffers back into Blender using the exported INI draw layout"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def execute(self, context):
-        scene = context.scene
-        _ensure_supported_profile(scene)
-
-        if not scene.modimp_export_dir.strip():
-            self.report({"ERROR"}, "Fill Export Dir first.")
-            return {"CANCELLED"}
-
-        try:
-            source_ib_hash = _resolve_export_package_hash(scene)
-            collection_name = f"{source_ib_hash}_roundtrip"
-            imported_objects, import_stats = import_exported_package(
-                context,
-                export_dir=scene.modimp_export_dir.strip(),
-                source_ib_hash=source_ib_hash,
-                collection_name=collection_name,
-                flip_uv_v=scene.modimp_flip_v,
-                shade_smooth=scene.modimp_shade_smooth,
-                store_orig_vertex_id=scene.modimp_store_orig_vertex_id,
-            )
-        except Exception as exc:  # pylint: disable=broad-except
-            self.report({"ERROR"}, str(exc))
-            return {"CANCELLED"}
-
-        self.report(
-            {"INFO"},
-            (
-                f"Imported {import_stats['slice_count']} exported draw objects, "
-                f"{import_stats['vertex_count']} verts, {import_stats['triangle_count']} tris into {collection_name}."
-            ),
-        )
         return {"FINISHED"}

@@ -349,6 +349,16 @@ def write_weight_pairs_buffer(
     return _write_bytes_if_changed(path, bytes(data))
 
 
+def write_u8x4_buffer(path: str, records: list[tuple[int, int, int, int]]) -> str:
+    """Write one packed uint8x4 record per vertex."""
+    data = bytearray()
+    for record in records:
+        if len(record) != 4:
+            raise ValueError("Expected exactly four uint8 values per record.")
+        data.extend(struct.pack("<4B", *[int(value) & 0xFF for value in record]))
+    return _write_bytes_if_changed(path, bytes(data))
+
+
 def write_half2x4_buffer(path: str, records: list[PackedHalf2x4]) -> str:
     """Write the packed half2x4 UV buffer."""
     data = bytearray()

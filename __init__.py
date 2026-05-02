@@ -26,11 +26,10 @@ if bpy is not None:
         operators.MODIMP_OT_create_export_collection,
         operators.MODIMP_OT_create_export_part,
         operators.MODIMP_OT_analyze_frame_stages,
-        operators.MODIMP_OT_rename_vertex_groups_from_palette,
+        operators.MODIMP_OT_apply_bone_merge_map_to_groups,
         operators.MODIMP_OT_restore_vertex_group_names,
         operators.MODIMP_OT_split_export_parts,
         operators.MODIMP_OT_export_collection_buffers,
-        operators.MODIMP_OT_import_exported_package,
         panel.VIEW3D_PT_mod_importer,
     )
 else:

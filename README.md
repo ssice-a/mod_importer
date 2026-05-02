@@ -1,77 +1,27 @@
 # Mod Importer
 
-这个 Blender 插件现在按“**通用核心 + Profile**”工作，当前首个实现的 Profile 是 **异环**。
+这是一个按“单集合桥梁”工作的 Blender 插件。当前主目标是异环 Profile，并以当前手写的 `83527398.ini` 与 `83527398-BoneStore.ini` 架构为准。
 
-## 当前异环 Profile 支持
+## 当前流程
 
-- 直接输入 `IB Hash` 自动从 `FrameAnalysis/log.txt + deduped` 解析模型
-- 导入整模所有 slice，而不是只导单个 draw
-- 导入并保留：
-  - pre-CS 位置 `7fec12c0`
-  - 权重索引/权重 `9337f625`
-  - pre-CS 法线/方向源 `d0b09bfb`
-  - packed UV `ad3c9baf`
-  - 原始 `firstindex/indexcount`
-  - 生产该 slice 的 CS dispatch / hash / `cs-cb0` hash
-- Blender 活动 UV 作为导出时的 `UV0`
-- 其余 3 组 packed `half2` 原样保存并导出
-- 顶点组命名使用纯数字字符串，便于和外部骨骼合并插件兼容
-- 按集合重建共享大缓冲并导出：
-  - `IB`
-  - pre-CS 位置
-  - 权重索引/权重
-  - pre-CS 法线/方向
-  - packed UV
-- 导出 runtime HLSL：
-  - `yihuan_collect_t0_cs.hlsl`
-  - `yihuan_gather_t0_cs.hlsl`
-
-## 不由本插件负责的内容
-
-- 不导出 palette / bone merge 数据
-- 不生成 INI
-- 外部 palette 继续由 `E:\vscode\3dmigoto_bone_merge` 导出
-
-## 导入流程
-
-1. 在侧边栏选择 `Profile = 异环`
-2. 填 `Frame Dump Dir`
-3. 填 `IB Hash`
-4. 点 `Resolve From IB Hash`
-5. 点 `Import Resolved Model`
-
-导入后，UI 会展示：
-
-- `Last CS Hash`
-- `Last CS CB0 Hash`
-- 对应 slice 的 `firstindex/indexcount`
-
-## 导出流程
-
-1. 编辑导入后的对象
-2. 确认集合中对象仍保留导入时写入的元数据和 attributes
-3. 填 `Export Collection`
-4. 填 `Export Dir`
-5. 点 `Export Collection Package`
-
-导出结果包括：
-
-- `buffers/`
-  - `{ib_hash}-ib.buf`
-  - `{ib_hash}-7fec12c0.buf`
-  - `{ib_hash}-9337f625.buf`
-  - `{ib_hash}-d0b09bfb.buf`
-  - `{ib_hash}-ad3c9baf.buf`
-- `hlsl/`
-  - `yihuan_collect_t0_cs.hlsl`
-  - `yihuan_gather_t0_cs.hlsl`
-- `draw_manifest.json`
-- `cs_batches.json`
-- `runtime_manifest.json`
+1. 在 `FrameAnalysis/Profile` 中分析帧分析目录，生成 stage map、CS collect map、draw pass map 和 BoneMergeMap。
+2. 插件只维护一个工作集合：`modimp_collection_name`。导入、外部模型分配、拆分和导出都围绕这一个集合进行。
+3. 把模型放进集合树：`source_ib_hash / region_hash-index_count-first_index / partXX / optional partXX_ibYY / mesh objects`。
+4. 对外部插件导入的模型，先执行 `Apply BoneMergeMap To Groups`，把局部顶点组编号转换成 BoneStore 全局骨骼编号。
+5. 导出时每个 IB 子集合独立生成 IB、position、blend、normal/frame、texcoord 和 per-IB palette。
+6. 默认可以只导出 buf；可选生成与当前手写 INI 对齐的 INI/BoneStore 资源。
 
 ## 重要约定
 
-- 当前运行时判断键采用 **最后一次相关 CS 的 `cs-cb0` 哈希**
-- 同时保留 `last_cs_hash` 作为辅助信息
-- 当前异环链路的骨骼采集 / 回填 HLSL 默认围绕 `cs-t0` 工作
-- 当前索引格式仍按 `R16_UINT` 处理，导出顶点窗口不能超过 `65536` 个可索引顶点
+- 导入和导出不耦合：导入只把可读 mesh 带进 Blender；导出只读取集合树与集合属性。
+- 不再支持旧的导入集合/导出集合双轨，也不再支持导入已导出的旧包。
+- 顶点组工具只读当前集合绑定的 BoneMergeMap，不再从外部 palette 文件推断。
+- 缺少 stage map、BoneMergeMap 或关键集合属性时直接报错，不猜测。
+- PS 材质槽位不由插件强行管理；用户可以基于生成模板或手写 INI 继续配置。
+
+## 导出限制
+
+- 单个导出 IB 使用 `R16_UINT`，顶点数不能超过 65535。
+- 单个导出 IB 的 local palette 不能超过 256 根骨骼。
+- 单个物体自身超过 65535 顶点或 256 根骨骼时，第一版只报错，不自动按三角面切碎。
+- 法线、tangent、UV 和权重会从导出临时 mesh 重新打包，不会破坏用户真实网格数据。

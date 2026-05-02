@@ -342,12 +342,30 @@ def analyze_yihuan_frame_stages(frame_dump_dir: str | None, ib_hash: str | None 
     dispatch_rows: list[dict[str, object]] = []
     for event_index, record in sorted(scan_result.dispatch_records.items()):
         cb0_hash = _artifact_hash(record.resources, "cb0") or ""
+        cb0_buf_path = _artifact_output(record.resources, "cb0", "buf") or ""
+        start_vertex = 0
+        vertex_count = 0
+        if record.cs_hash in {_PRIMARY_CS_HASH, _LAST_CS_HASH} and cb0_buf_path:
+            cb0_values = read_u32_buffer(str(cb0_buf_path))
+            if len(cb0_values) >= 4:
+                if record.cs_hash == _PRIMARY_CS_HASH:
+                    start_vertex = int(cb0_values[1])
+                    vertex_count = int(cb0_values[2])
+                else:
+                    start_vertex = int(cb0_values[2])
+                    vertex_count = int(cb0_values[3])
         dispatch_rows.append(
             {
                 "event_index": event_index,
                 "filter_index": 3300 if record.cs_hash == _PRIMARY_CS_HASH else 3301 if record.cs_hash == _LAST_CS_HASH else 3399,
                 "cs_hash": record.cs_hash or "",
                 "cb0_hash": cb0_hash,
+                "t0_hash": _artifact_hash(record.resources, "t0") or "",
+                "cb0_buf_path": cb0_buf_path,
+                "t0_buf_path": _artifact_output(record.resources, "t0", "buf") or "",
+                "u1_buf_path": _artifact_output(record.resources, "u1", "buf") or "",
+                "start_vertex": start_vertex,
+                "vertex_count": vertex_count,
                 "thread_group_count": [
                     int(record.thread_group_count_x or 0),
                     int(record.thread_group_count_y or 0),
@@ -357,12 +375,24 @@ def analyze_yihuan_frame_stages(frame_dump_dir: str | None, ib_hash: str | None 
             }
         )
 
+    stage_candidates: dict[str, list[dict[str, object]]] = {}
+    for row in draw_rows:
+        stage_candidates.setdefault(str(row["stage"]), []).append(row)
+    stage_map = {
+        f"{stage}:{vs_hash}": filter_index
+        for (stage, vs_hash), filter_index in sorted(shader_to_filter.items(), key=lambda item: item[1])
+    }
+
     return {
         "profile_id": YIHUAN_PROFILE.profile_id,
         "frame_dump_dir": scan_result.frame_dump_dir,
         "raw_ib_hash": raw_ib_hash,
         "draw_count": len(draw_rows),
         "dispatch_count": len(dispatch_rows),
+        "stage_candidates": stage_candidates,
+        "stage_map": stage_map,
+        "draw_pass_map": draw_rows,
+        "cs_collect_map": dispatch_rows,
         "draws": draw_rows,
         "dispatches": dispatch_rows,
     }

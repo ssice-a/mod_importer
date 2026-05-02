@@ -84,6 +84,15 @@ class YihuanDataConverter(GameDataConverter):
     profile_id = "yihuan"
     _axis_signs = (-1.0, -1.0, 1.0)
     _position_scale = 0.01
+    _blender_display_normal_sign = -1.0
+
+    def _to_blender_display_normal(self, normal: Vec3) -> Vec3:
+        sign = self._blender_display_normal_sign
+        return (normal[0] * sign, normal[1] * sign, normal[2] * sign)
+
+    def _from_blender_display_normal(self, normal: Vec3) -> Vec3:
+        sign = self._blender_display_normal_sign
+        return (normal[0] * sign, normal[1] * sign, normal[2] * sign)
 
     def to_blender_position(self, position: Vec3) -> Vec3:
         return (
@@ -125,8 +134,11 @@ class YihuanDataConverter(GameDataConverter):
         decoded_frames: list[DecodedTangentFrame] = []
         for record_a, record_b in zip(frame_a, frame_b):
             tangent = _normalize3(self.to_blender_direction(record_a[:3]))
-            # This chain stores the normal axis with an inverted sign.
-            normal = _normalize3(self.to_blender_direction(tuple(-value for value in record_b[:3])))
+            normal = _normalize3(
+                self._to_blender_display_normal(
+                    self.to_blender_direction(record_b[:3])
+                )
+            )
             bitangent_sign = 1.0 if record_b[3] >= 0.0 else -1.0
             decoded_frames.append(
                 DecodedTangentFrame(
@@ -150,13 +162,13 @@ class YihuanDataConverter(GameDataConverter):
         frame_b: list[Snorm4] = []
         for tangent, normal, bitangent_sign in zip(tangents, normals, bitangent_signs):
             tangent_game = _normalize3(self.from_blender_direction(tangent))
-            normal_game = _normalize3(self.from_blender_direction(normal))
+            normal_game = _normalize3(self.from_blender_direction(self._from_blender_display_normal(normal)))
             frame_a.append((tangent_game[0], tangent_game[1], tangent_game[2], 1.0))
             frame_b.append(
                 (
-                    -normal_game[0],
-                    -normal_game[1],
-                    -normal_game[2],
+                    normal_game[0],
+                    normal_game[1],
+                    normal_game[2],
                     1.0 if bitangent_sign >= 0.0 else -1.0,
                 )
             )
@@ -172,7 +184,11 @@ class YihuanDataConverter(GameDataConverter):
         decoded_frames: list[DecodedTangentFrame] = []
         for record_a, record_b in zip(frame_a, frame_b):
             tangent = _normalize3(self.to_blender_direction(record_a[:3]))
-            normal = _normalize3(self.to_blender_direction(tuple(-value for value in record_b[:3])))
+            normal = _normalize3(
+                self._to_blender_display_normal(
+                    self.to_blender_direction(record_b[:3])
+                )
+            )
             decoded_frames.append(
                 DecodedTangentFrame(
                     tangent=tangent,
