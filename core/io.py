@@ -225,20 +225,6 @@ def read_weight_pairs(path: str, *, vertex_count: int | None = None) -> tuple[li
     return indices, weights
 
 
-def read_u32_at_byte_offset(path: str, byte_offset: int) -> int:
-    """Read one uint32 from the given byte offset inside a raw buffer dump."""
-    data = Path(path).read_bytes()
-    if len(data) == 0:
-        raise ValueError(f"Buffer is empty: {path}")
-    if byte_offset < 0:
-        raise ValueError(f"Byte offset must be non-negative: {byte_offset}")
-    if byte_offset + 4 > len(data):
-        raise ValueError(
-            f"Byte offset {byte_offset} is outside the buffer range for {path} ({len(data)} bytes)."
-        )
-    return struct.unpack_from("<I", data, byte_offset)[0]
-
-
 def read_u32_buffer(path: str) -> list[int]:
     """Read a raw buffer as little-endian uint32 values."""
     data = Path(path).read_bytes()

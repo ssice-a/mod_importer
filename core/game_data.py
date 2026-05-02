@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-from .models import SectionTransform, Snorm4
+from .models import Snorm4
 
 
 Vec3 = tuple[float, float, float]
@@ -73,10 +73,6 @@ class GameDataConverter(ABC):
     ) -> list[DecodedTangentFrame]:
         """Decode one post-CS packed tangent frame per vertex into Blender space."""
 
-    @abstractmethod
-    def to_blender_section_transform(self, section_transform: SectionTransform) -> SectionTransform:
-        """Convert one rigid section transform from game space into Blender space."""
-
 
 class YihuanDataConverter(GameDataConverter):
     """异环 profile conversion rules."""
@@ -84,6 +80,8 @@ class YihuanDataConverter(GameDataConverter):
     profile_id = "yihuan"
     _axis_signs = (-1.0, -1.0, 1.0)
     _position_scale = 0.01
+    # Keep mesh winding untouched. This title's packed frame normal needs the
+    # opposite display direction in Blender, while export converts it back.
     _blender_display_normal_sign = -1.0
 
     def _to_blender_display_normal(self, normal: Vec3) -> Vec3:
@@ -197,37 +195,6 @@ class YihuanDataConverter(GameDataConverter):
                 )
             )
         return decoded_frames
-
-    def to_blender_section_transform(self, section_transform: SectionTransform) -> SectionTransform:
-        axis_signs = self._axis_signs
-        linear_rows = (
-            (section_transform.basis_x[0], section_transform.basis_y[0], section_transform.basis_z[0]),
-            (section_transform.basis_x[1], section_transform.basis_y[1], section_transform.basis_z[1]),
-            (section_transform.basis_x[2], section_transform.basis_y[2], section_transform.basis_z[2]),
-        )
-        converted_rows = []
-        for row_index, row in enumerate(linear_rows):
-            converted_rows.append(
-                tuple(
-                    axis_signs[row_index] * row[column_index] * axis_signs[column_index]
-                    for column_index in range(3)
-                )
-            )
-
-        return SectionTransform(
-            basis_x=(converted_rows[0][0], converted_rows[1][0], converted_rows[2][0]),
-            basis_y=(converted_rows[0][1], converted_rows[1][1], converted_rows[2][1]),
-            basis_z=(converted_rows[0][2], converted_rows[1][2], converted_rows[2][2]),
-            translation=(
-                axis_signs[0] * section_transform.translation[0] * self._position_scale,
-                axis_signs[1] * section_transform.translation[1] * self._position_scale,
-                axis_signs[2] * section_transform.translation[2] * self._position_scale,
-            ),
-            section_selector=section_transform.section_selector,
-            section_record=section_transform.section_record,
-            source_label=section_transform.source_label,
-        )
-
 
 _CONVERTERS = {
     YihuanDataConverter.profile_id: YihuanDataConverter(),

@@ -1107,10 +1107,9 @@ class MODIMP_OT_import_resolved_model(bpy.types.Operator):
                 object_prefix=object_prefix,
                 collection_name=collection_name,
                 flip_uv_v=scene.modimp_flip_v,
+                mirror_flip=scene.modimp_mirror_flip,
                 shade_smooth=scene.modimp_shade_smooth,
                 store_orig_vertex_id=scene.modimp_store_orig_vertex_id,
-                create_section_vertex_group=scene.modimp_create_section_vertex_groups,
-                apply_section_transform=scene.modimp_apply_section_transform,
                 use_pre_cs_source=scene.modimp_use_pre_cs_source,
             )
             working_collection = _ensure_scene_collection_linked(scene, collection_name)

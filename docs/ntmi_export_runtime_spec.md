@@ -200,6 +200,93 @@ matrix rows = PoseGlobalT0[global bone * 3 + 0..2]
 - LocalT0 中间 buffer
 - BoneStore 旧命名资源
 
+## Shapekey 运行时方案
+
+统一命名使用 `shapekey`，不要再混用 morph / shape key / blendshape。第一版目标是保持 Blender 所见即所得，同时允许运行时通过权重 buffer 调整 shapekey。
+
+### 执行顺序
+
+shapekey 必须发生在蒙皮前：
+
+```text
+Basis 静态 position/frame
+-> ApplyShapekeyPreSkin
+-> CommandList\NTMIv1\SkinFromBoundSlots
+-> DrawIndexed fast TextureOverride
+```
+
+不要在蒙皮后修改 position。shapekey 是模型局部空间变形，必须先改未蒙皮的 position 和 frame，再交给骨骼蒙皮。
+
+### 资源分组
+
+导出资源只分两类逻辑数据区，避免资源段膨胀：
+
+```ini
+[ResourcePart_<part>_ShapekeyStatic]
+type = Buffer
+format = R32_FLOAT
+filename = Buffer/<part>-shapekey-static.buf
+
+[ResourcePart_<part>_ShapekeyRuntime_UAV]
+type = RWBuffer
+format = R32_FLOAT
+array = <shapekey_count>
+
+[ResourcePart_<part>_ShapekeyRuntime]
+type = Buffer
+format = R32_FLOAT
+array = <shapekey_count>
+```
+
+- `ShapekeyStatic` 保存该 part 的全部 shapekey 静态数据，包括 header、每个 shapekey 的 delta position、delta normal/tangent/frame 所需数据。具体打包格式由 Core HLSL 固定，导出器只按该 ABI 写。
+- `ShapekeyRuntime` 保存当前 shapekey 权重，长度等于 `shapekey_count`。用户可以用按键、动画或额外 HLSL 写这个 buffer。
+- `ShapekeyRuntime_UAV` 和 `ShapekeyRuntime` 只是同一个动态数据区的写视图/读视图；不允许再生成单独的 default weights、per-key weight 或临时 morph buffer。
+- 如果某个 part 没有 shapekey，不生成这两类资源，也不调用 `ApplyShapekeyPreSkin`。
+
+### 初始权重
+
+导出必须记录 Blender 当前 shapekey 值，并作为运行时初始值写入 `ShapekeyRuntime`：
+
+```text
+Blender 导出前 Key_A.value = 0.7
+=> 导出的 ResourcePart_<part>_ShapekeyRuntime 初始 Key_A 权重也必须是 0.7
+```
+
+这条是所见即所得的硬约束。也就是说，导出后的游戏初始画面应等价于 Blender 当前形态键混合结果，而不是默认回到 0。
+
+### 顶点顺序约束
+
+shapekey delta 必须按最终导出顶点顺序写入，而不是 Blender 原始顶点 index。导出器的统一顺序是：
+
+1. 生成最终 part 顶点重编号。
+2. 用同一套重编号写 position、blend、frame、texcoord、outline。
+3. 用同一套重编号写 shapekey delta。
+4. 用同一套 part/palette 划分生成 shapekey 静态数据。
+
+如果一个 region 因 local palette 超过 256 被拆成多个导出 part，每个 part 都有自己的 `ShapekeyStatic` 和 `ShapekeyRuntime`。不能共用原始大模型的 shapekey 索引。
+
+### 法线与 frame
+
+shapekey 必须影响 position 和 frame。只改 position 会导致 g-buffer、轮廓线、边缘光和法线贴图表现不一致。
+
+建议导出：
+
+```text
+delta_position = shapekey_position - basis_position
+delta_normal   = shapekey_normal - basis_normal
+delta_tangent  = shapekey_tangent - basis_tangent
+```
+
+运行时：
+
+```text
+position = basis_position + sum(weight * delta_position)
+normal   = normalize(basis_normal + sum(weight * delta_normal))
+tangent  = normalize(basis_tangent + sum(weight * delta_tangent))
+```
+
+导出器必须使用 Blender evaluated mesh / custom normal 的当前结果作为数据来源，并按游戏原始 frame 格式重新打包。坐标和符号仍由 profile converter 统一处理。
+
 ## 推荐生成的 INI 结构
 
 ### 主 INI
@@ -310,7 +397,14 @@ RuntimePrevSkinnedPosition array = vertex_count * 3
 
 ### Texture
 
-贴图资源仍按普通 3Dmigoto 写法：
+贴图资源仍按普通 3Dmigoto 写法。异环 profile 当前默认从可见 g-buffer draw 中识别这些槽位：
+
+- `ps-t5`：法线贴图。
+- `ps-t7`：基础色贴图。
+- `ps-t8`：材质贴图。
+- `ps-t18`：材质贴图。
+
+FrameAnalysis 解析器应优先从目标 region 中 RT 输出数量最多的可见 g-buffer draw 提取这些 PS 资源，并记录 resource hash、dump 文件路径、槽位号、draw id 与 PS hash。导出器再把确认后的贴图复制或写入 `Texture/`。
 
 ```ini
 [ResourceT5]
@@ -331,6 +425,13 @@ ps-t7 = ResourceT7
 ps-t8 = ResourceT8
 ps-t18 = ResourceT18
 ```
+
+Blender 导入时应自动创建材质：
+
+- `ps-t7` 对应基础色，Image Texture 使用 sRGB，连接 Principled BSDF 的 `Base Color`。
+- `ps-t5` 对应法线，Image Texture 使用 Non-Color，经 `Normal Map` 节点连接 Principled BSDF 的 `Normal`。
+- `ps-t8` 与 `ps-t18` 按 Non-Color 导入，保留节点与材质属性，第一版不猜测通道语义。
+- 如果用户后续替换材质贴图，导出时以 Blender 材质当前引用为准。
 
 ## 工具需要保存的元数据
 

@@ -62,10 +62,9 @@ class VIEW3D_PT_mod_importer(bpy.types.Panel):
         import_box.prop(scene, "modimp_object_prefix")
         import_box.prop(scene, "modimp_use_pre_cs_source")
         import_box.prop(scene, "modimp_flip_v")
+        import_box.prop(scene, "modimp_mirror_flip")
         import_box.prop(scene, "modimp_shade_smooth")
         import_box.prop(scene, "modimp_store_orig_vertex_id")
-        import_box.prop(scene, "modimp_create_section_vertex_groups")
-        import_box.prop(scene, "modimp_apply_section_transform")
         import_box.operator("modimp.import_resolved_model", icon="MESH_DATA")
 
         export_box = layout.box()

@@ -5,15 +5,12 @@ from __future__ import annotations
 import json
 import math
 import re
-import struct
-from collections import defaultdict
 from pathlib import Path
 
 import bpy
 from mathutils import Vector
 
 from .game_data import get_game_data_converter
-from .hlsl_assets import export_profile_hlsl_assets
 from .io import (
     write_float3_buffer,
     write_half2x4_buffer,
@@ -51,19 +48,20 @@ _BMC_MATCH_INDEX_COUNT_PROP = "modimp_bmc_match_index_count"
 _BMC_CHUNK_INDEX_PROP = "modimp_bmc_chunk_index"
 _DRAW_TOGGLE_PROP = "modimp_draw_toggle"
 _DRAW_TOGGLE_KEY_PROP = "modimp_draw_toggle_key"
+_MIRROR_FLIP_PROP = "modimp_mirror_flip"
+_COLLECTOR_GROUP_SLOT_PROP = "modimp_collector_group_slot"
+_COLLECTOR_T0_HASH_PROP = "modimp_collector_t0_hash"
+_COLLECTOR_U0_HASH_PROP = "modimp_collector_u0_hash"
+_COLLECTOR_U1_HASH_PROP = "modimp_collector_u1_hash"
+_COLLECTOR_COLLECT_KEY_PROP = "modimp_collector_collect_key"
+_COLLECTOR_FINISH_CONDITION_PROP = "modimp_collector_finish_condition"
+_MATCH_VS_TEXCOORD_HASH_PROP = "modimp_match_vs_texcoord_hash"
+_MATCH_VS_POSITION_HASH_PROP = "modimp_match_vs_position_hash"
+_MATCH_VS_OUTLINE_HASH_PROP = "modimp_match_vs_outline_hash"
 _SHAPE_KEY_BAKE_POLICY = "bake_current_relative_mix_to_base_mesh_copy"
 _YIHUAN_DEFAULT_PRODUCER_CS_HASH = "f33fea3cca2704e4"
 _YIHUAN_DEFAULT_LAST_CS_HASH = "f33fea3cca2704e4"
 _YIHUAN_DEFAULT_LAST_CS_CB0_HASH = "7816b819"
-_YIHUAN_CS_FILTER_INDICES = {
-    "f33fea3cca2704e4": 3300,
-    "1e2a9061eadfeb6c": 3301,
-}
-_YIHUAN_BONESTORE_NAMESPACE = "YihuanBoneStore"
-_YIHUAN_RUNTIME_HLSL_SUFFIX = "85b15a7f"
-_YIHUAN_DEPTH_VS_FILTER_BASE = 4100
-_YIHUAN_GBUFFER_VS_FILTER_BASE = 4200
-_YIHUAN_REVERSE_EXPORT_WINDING = True
 _YIHUAN_BODY_TEXTURE_RESOURCES = (
     ("ResourceT5", "Texture/NM.dds"),
     ("ResourceT7", "Texture/Body.dds"),
@@ -75,6 +73,19 @@ _YIHUAN_DEFAULT_DRAW_TOGGLES = {
     "4c512c5c-52407-0.006": ("bohe_draw_lower_group", "VK_NUMPAD2"),
     "4c512c5c-62346-52407.002": ("bohe_draw_lower_group", "VK_NUMPAD2"),
 }
+_NTMI_CORE_GLOBAL_T0_RESOURCE = r"Resource\NTMIv1\RuntimeGlobalT0"
+_NTMI_CORE_SKIN_COMMAND = r"CommandList\NTMIv1\SkinFromBoundSlots"
+_NTMI_CORE_VERTEX_COUNT = r"$\NTMIv1\vertex_count"
+_NTMI_DEFAULT_DYNAMIC_SLOTS = 16
+_NTMI_DEFAULT_COLLECTOR_GROUP_SLOT = "cs-u1"
+_NTMI_DEFAULT_COLLECTOR_T0_HASH = "bed2036c"
+_NTMI_DEFAULT_COLLECTOR_U0_HASH = "4c1f57af"
+_NTMI_DEFAULT_COLLECTOR_U1_HASH = "689792de"
+_NTMI_DEFAULT_COLLECT_KEY = "cs-cb0[1]"
+_NTMI_DEFAULT_FINISH_CONDITION = "cs-cb0[1] == 12675 && cs-cb0[2] == 14431"
+_NTMI_DEFAULT_MATCH_TEXCOORD_HASH = "9f1ca2bd"
+_NTMI_DEFAULT_MATCH_POSITION_HASH = "b9df1c62"
+_NTMI_DEFAULT_MATCH_OUTLINE_HASH = "7172d406"
 
 
 def _hash_tuple(value: object) -> tuple[str, ...]:
@@ -99,34 +110,12 @@ def _hash_tuple(value: object) -> tuple[str, ...]:
     return tuple(hashes)
 
 
-def _yihuan_bonestore_namespace(region_packages: list[dict[str, object]]) -> str:
-    source_ib_hash = ""
-    if region_packages:
-        source_ib_hash = str(region_packages[0].get("source_ib_hash", "") or "").strip().lower()
-    if not _REGION_HASH_RE.fullmatch(source_ib_hash):
-        return _YIHUAN_BONESTORE_NAMESPACE
-    return f"{_YIHUAN_BONESTORE_NAMESPACE}_{source_ib_hash}"
-
-
 def _yihuan_source_suffix(region_packages: list[dict[str, object]]) -> str:
     if region_packages:
         source_ib_hash = str(region_packages[0].get("source_ib_hash", "") or "").strip().lower()
         if _REGION_HASH_RE.fullmatch(source_ib_hash):
             return source_ib_hash
     return "shared"
-
-
-def _yihuan_restore_resource(resource_suffix: str, slot_name: str) -> str:
-    return f"ResourceYihuan_{resource_suffix}_Restore{slot_name}"
-
-
-def _yihuan_runtime_resource(resource_suffix: str, name: str) -> str:
-    return f"ResourceYihuan_{resource_suffix}_Runtime{name}"
-
-
-def _yihuan_texture_resource(resource_suffix: str, resource_name: str) -> str:
-    short_name = resource_name.removeprefix("Resource")
-    return f"ResourceYihuan_{resource_suffix}_{short_name}"
 
 
 def _region_override_name(package: dict[str, object]) -> str:
@@ -373,6 +362,10 @@ def _normalized_vector(vector: tuple[float, float, float]) -> tuple[float, float
     return (vector[0] / length, vector[1] / length, vector[2] / length)
 
 
+def _mirror_x_vector(vector: tuple[float, float, float]) -> tuple[float, float, float]:
+    return (-float(vector[0]), float(vector[1]), float(vector[2]))
+
+
 def _vector_key(vector: tuple[float, float, float]) -> tuple[int, int, int]:
     return tuple(int(round(float(component) * 1_000_000.0)) for component in vector)
 
@@ -513,6 +506,7 @@ def _extract_object_payload(
     if profile_id != YIHUAN_PROFILE.profile_id:
         raise ValueError(f"{obj.name}: unsupported profile id")
     converter = get_game_data_converter(profile_id)
+    mirror_flip = bool(obj.get(_MIRROR_FLIP_PROP, False))
 
     depsgraph = bpy.context.evaluated_depsgraph_get()
     missing_optional_attributes: list[str] = []
@@ -592,6 +586,10 @@ def _extract_object_payload(
                         mesh_copy,
                         source_vertex_index,
                     )
+                if mirror_flip:
+                    decoded_tangent = _mirror_x_vector(decoded_tangent)
+                    decoded_normal = _mirror_x_vector(decoded_normal)
+                    decoded_sign = -decoded_sign
 
                 key = (
                     source_vertex_index,
@@ -606,9 +604,12 @@ def _extract_object_payload(
                 out_vertex_index = remap.get(key)
                 if out_vertex_index is None:
                     source_position = mesh_copy.vertices[source_vertex_index].co
+                    export_position = (float(source_position.x), float(source_position.y), float(source_position.z))
+                    if mirror_flip:
+                        export_position = _mirror_x_vector(export_position)
                     positions.append(
                         converter.from_blender_position(
-                            (float(source_position.x), float(source_position.y), float(source_position.z))
+                            export_position
                         )
                     )
                     packed_uv_entries.append(
@@ -628,13 +629,8 @@ def _extract_object_payload(
                     out_vertex_index = len(positions) - 1
                     remap[key] = out_vertex_index
                 triangle.append(out_vertex_index)
-            # The profile transform mirrors handedness relative to Blender's
-            # viewport. Reverse only the index winding so culling/front-face
-            # matches the game, while keeping custom normal/tangent data intact.
-            if _YIHUAN_REVERSE_EXPORT_WINDING:
-                triangles.append((triangle[0], triangle[2], triangle[1]))
-            else:
-                triangles.append(tuple(triangle))
+            # Export the evaluated Blender mesh as-is; no hidden winding fixup.
+            triangles.append(tuple(triangle))
     finally:
         bpy.data.meshes.remove(mesh_copy)
 
@@ -676,10 +672,6 @@ def _extract_object_payload(
         "last_cs_cb0_hash": last_cs_cb0_hash,
         "last_consumer_draw_index": int(last_consumer_draw_index),
     }
-
-
-def _ceil_div(value: int, divisor: int) -> int:
-    return max(1, (int(value) + int(divisor) - 1) // int(divisor))
 
 
 def _resource_token(value: str) -> str:
@@ -751,6 +743,15 @@ def _collection_runtime_contract(
         "last_consumer_draw_index": last_consumer_draw_index,
         "depth_vs_hashes": _optional_str_collection_prop(collection, _DEPTH_VS_HASHES_PROP),
         "gbuffer_vs_hashes": _optional_str_collection_prop(collection, _GBUFFER_VS_HASHES_PROP),
+        "collector_group_slot": _optional_str_collection_prop(collection, _COLLECTOR_GROUP_SLOT_PROP),
+        "collector_t0_hash": _optional_str_collection_prop(collection, _COLLECTOR_T0_HASH_PROP),
+        "collector_u0_hash": _optional_str_collection_prop(collection, _COLLECTOR_U0_HASH_PROP),
+        "collector_u1_hash": _optional_str_collection_prop(collection, _COLLECTOR_U1_HASH_PROP),
+        "collector_collect_key": _optional_str_collection_prop(collection, _COLLECTOR_COLLECT_KEY_PROP),
+        "collector_finish_condition": _optional_str_collection_prop(collection, _COLLECTOR_FINISH_CONDITION_PROP),
+        "match_vs_texcoord_hash": _optional_str_collection_prop(collection, _MATCH_VS_TEXCOORD_HASH_PROP),
+        "match_vs_position_hash": _optional_str_collection_prop(collection, _MATCH_VS_POSITION_HASH_PROP),
+        "match_vs_outline_hash": _optional_str_collection_prop(collection, _MATCH_VS_OUTLINE_HASH_PROP),
     }
 
 
@@ -1048,6 +1049,20 @@ def _resolve_original_match_index_count(
     raise ValueError(f"{region_hash}: region collection must define modimp_region_index_count.")
 
 
+def _write_index_buffer_auto(path: Path, indices: list[int]) -> str:
+    if not indices:
+        raise ValueError(f"{path.name}: cannot write an empty index buffer.")
+    min_index = min(indices)
+    max_index = max(indices)
+    if min_index < 0:
+        raise ValueError(f"{path.name}: index buffer contains a negative index: {min_index}")
+    if max_index <= 0xFFFF:
+        write_u16_buffer(str(path), indices)
+        return "DXGI_FORMAT_R16_UINT"
+    write_u32_buffer(str(path), indices)
+    return "DXGI_FORMAT_R32_UINT"
+
+
 def _export_part_buffers(
     *,
     part_definition: dict[str, object],
@@ -1176,14 +1191,7 @@ def _export_part_buffers(
                 "baked_shape_keys": list(payload["baked_shape_keys"]),
                 "missing_optional_attributes": list(payload["missing_optional_attributes"]),
                 "local_palette_count": int(payload["local_palette_count"]),
-                "local_t0_rows": int(payload["local_palette_count"]) * 3,
             }
-        )
-
-    if vertex_cursor > 0xFFFF:
-        raise ValueError(
-            f"Export part '{part_name}' has {vertex_cursor} vertices, exceeding the R16_UINT index window "
-            "(65535 vertices for this exporter). Split this part into smaller export child collections."
         )
 
     if not all_indices:
@@ -1203,16 +1211,14 @@ def _export_part_buffers(
         "frame_pre_cs": f"{part_name}-normal.buf",
         "packed_uv": f"{part_name}-texcoord.buf",
         "outline_param": f"{part_name}-outline.buf",
-        "skin_cb0": f"{part_name}-cb0.buf",
     }
 
-    write_u16_buffer(str(buffer_dir / files["ib"]), all_indices)
+    ib_format = _write_index_buffer_auto(buffer_dir / files["ib"], all_indices)
     write_float3_buffer(str(buffer_dir / files["vb0_pre_cs"]), all_positions)
     write_weight_pairs_buffer(str(buffer_dir / files["weights"]), all_blend_indices, all_blend_weights)
     write_snorm8x4_pairs_buffer(str(buffer_dir / files["frame_pre_cs"]), all_frame_a, all_frame_b)
     write_half2x4_buffer(str(buffer_dir / files["packed_uv"]), all_packed_uv_entries)
     write_u8x4_buffer(str(buffer_dir / files["outline_param"]), all_outline_params)
-    write_u32_buffer(str(buffer_dir / files["skin_cb0"]), [0, vertex_cursor, 0, palette_entry_count])
     write_u32_buffer(str(buffer_dir / bmc_palette_file), palette_entries)
 
     return {
@@ -1225,6 +1231,7 @@ def _export_part_buffers(
         "source_ib_hash": ib_hash,
         "vertex_count": vertex_cursor,
         "index_count": len(all_indices),
+        "ib_format": ib_format,
         "triangle_count": len(all_indices) // 3,
         "buffers": files,
         "draws": draw_records,
@@ -1240,7 +1247,6 @@ def _export_part_buffers(
         "bmc_match_index_count": int(bmc_match_index_count),
         "bmc_chunk_index": int(bmc_chunk_index),
         "local_palette_count": palette_entry_count,
-        "local_t0_rows": palette_entry_count * 3,
         "required_local_palette_count": required_local_palette_count,
     }
 
@@ -1250,10 +1256,6 @@ def _draws_for_ini(parts: list[dict[str, object]]) -> list[dict[str, object]]:
     for part in parts:
         draws.extend(part["draws"])
     return draws
-
-
-def _float_to_u32(value: float) -> int:
-    return struct.unpack("<I", struct.pack("<f", float(value)))[0]
 
 
 def _collection_json_text(collection: bpy.types.Collection, key: str) -> dict[str, object]:
@@ -1302,210 +1304,6 @@ def _bone_merge_dispatches(source_collection: bpy.types.Collection | None) -> li
     )
 
 
-def _part_original_identity(part: dict[str, object]) -> tuple[int | None, int | None]:
-    draws = list(part.get("draws", []))
-    if not draws:
-        return None, None
-    first_draw = draws[0]
-    try:
-        first_index = int(first_draw["original_first_index"])
-        index_count = int(first_draw["original_index_count"])
-    except (KeyError, TypeError, ValueError):
-        return None, None
-    return first_index, index_count
-
-
-def _dispatch_matches_part(dispatch: dict[str, object], part: dict[str, object]) -> bool:
-    first_index, index_count = _part_original_identity(part)
-    if first_index is None or index_count is None:
-        return False
-    try:
-        return int(dispatch.get("first_index")) == first_index and int(dispatch.get("index_count")) == index_count
-    except (TypeError, ValueError):
-        return False
-
-
-def _global_bone_count(parts: list[dict[str, object]], source_collection: bpy.types.Collection | None = None) -> int:
-    max_from_palette = max(
-        (max((int(value) for value in part.get("palette_entries", [])), default=-1) for part in parts),
-        default=-1,
-    ) + 1
-    max_from_dispatch = max(
-        (
-            int(dispatch["global_bone_base"]) + int(dispatch["bone_count"])
-            for dispatch in _bone_merge_dispatches(source_collection)
-        ),
-        default=0,
-    )
-    return max(1, max_from_palette, max_from_dispatch)
-
-
-def _character_meta_rows(
-    parts: list[dict[str, object]],
-    source_collection: bpy.types.Collection | None = None,
-) -> list[tuple[int, int, int, int]]:
-    pose_slots = 16
-    max_vertex_count = max((int(part["vertex_count"]) for part in parts), default=1)
-    global_bone_count = _global_bone_count(parts, source_collection)
-    global_row_count = global_bone_count * 3
-    dispatches = _bone_merge_dispatches(source_collection)
-    if source_collection is not None and not dispatches:
-        raise ValueError(
-            f"Collection '{source_collection.name}' has no BoneMergeMap dispatch rows. "
-            "Run FrameAnalysis/Profile first so CharacterMetaTable can collect native bones."
-        )
-    max_palette_global = max(
-        (max((int(value) for value in part.get("palette_entries", [])), default=-1) for part in parts),
-        default=-1,
-    )
-    if dispatches and max_palette_global >= 0:
-        dispatches = [
-            dispatch for dispatch in dispatches
-            if int(dispatch["global_bone_base"]) <= max_palette_global
-        ]
-
-    feature_dispatch = next(
-        (
-            dispatch for dispatch in dispatches
-            for part in parts
-            if _dispatch_matches_part(dispatch, part)
-        ),
-        dispatches[0] if dispatches else {},
-    )
-    feature_start = int(feature_dispatch.get("producer_start_vertex") or 0)
-    feature_count = int(feature_dispatch.get("producer_vertex_count") or max_vertex_count)
-    feature_count = max(1, feature_count)
-    feature_samples = min(4096, feature_count)
-    feature_threshold = _float_to_u32(0.001)
-
-    feature_row = 4
-    collect_row_base = 5
-    rows: list[tuple[int, int, int, int]] = [
-        (0, 0, 0, 0),
-        (pose_slots, max_vertex_count, 0, 0),
-        (global_bone_count, global_row_count, 0, len(dispatches)),
-        (feature_row, 0, collect_row_base, 0),
-        (feature_start, feature_count, feature_samples, feature_threshold),
-    ]
-    def fallback_vertex_window(dispatch: dict[str, object]) -> tuple[int, int]:
-        for part in parts:
-            if not _dispatch_matches_part(dispatch, part):
-                continue
-            return 0, max(1, int(part.get("vertex_count") or max_vertex_count))
-        return 0, max(1, max_vertex_count)
-
-    for dispatch in dispatches:
-        start_vertex = int(dispatch.get("producer_start_vertex") or dispatch.get("start_vertex") or 0)
-        vertex_count = int(dispatch.get("producer_vertex_count") or dispatch.get("vertex_count") or 0)
-        if vertex_count <= 0:
-            start_vertex, vertex_count = fallback_vertex_window(dispatch)
-        rows.append(
-            (
-                start_vertex,
-                vertex_count,
-                int(dispatch["global_bone_base"]),
-                int(dispatch["bone_count"]),
-            )
-        )
-    return rows
-
-
-def _yihuan_stage_filters(
-    source_collection: bpy.types.Collection,
-    region_packages: list[dict[str, object]],
-) -> dict[str, dict[str, int]]:
-    depth_hashes: list[str] = []
-    gbuffer_hashes: list[str] = []
-    for package in region_packages:
-        depth_hashes.extend(_hash_tuple(package.get("depth_vs_hashes")))
-        gbuffer_hashes.extend(_hash_tuple(package.get("gbuffer_vs_hashes")))
-
-    def unique_sorted(values: list[str]) -> list[str]:
-        return sorted(set(values))
-
-    # If the same VS hash appears with both slot layouts in a frame, 3DMigoto can
-    # only assign one filter_index. Prefer the fuller GBuffer layout because it
-    # is the one that needs vs-t6/vs-t7 and avoids binding the shader as a
-    # depth-only pass.
-    gbuffer_hash_set = set(gbuffer_hashes)
-    depth_unique = [value for value in unique_sorted(depth_hashes) if value not in gbuffer_hash_set]
-    gbuffer_unique = unique_sorted(gbuffer_hashes)
-
-    stage_filters = {
-        "depth": {
-            hash_value: _YIHUAN_DEPTH_VS_FILTER_BASE + index
-            for index, hash_value in enumerate(depth_unique)
-        },
-        "gbuffer": {
-            hash_value: _YIHUAN_GBUFFER_VS_FILTER_BASE + index
-            for index, hash_value in enumerate(gbuffer_unique)
-        },
-    }
-    stage_map_text_name = _optional_str_collection_prop(source_collection, _STAGE_MAP_TEXT_PROP)
-    if not stage_map_text_name:
-        return stage_filters
-
-    stage_map_text = bpy.data.texts.get(stage_map_text_name)
-    if stage_map_text is None:
-        return stage_filters
-    try:
-        stage_map_payload = json.loads(stage_map_text.as_string())
-    except json.JSONDecodeError:
-        return stage_filters
-    raw_stage_map = stage_map_payload.get("stage_map", {})
-    if not isinstance(raw_stage_map, dict):
-        return stage_filters
-
-    known_hashes = {"depth": set(depth_unique), "gbuffer": set(gbuffer_unique)}
-    for raw_key, raw_filter_index in raw_stage_map.items():
-        try:
-            filter_index = int(raw_filter_index)
-        except (TypeError, ValueError):
-            continue
-        key = str(raw_key or "").strip().lower()
-        if ":" in key:
-            stage_name, vs_hash = key.split(":", 1)
-        else:
-            vs_hash = key
-            if _YIHUAN_DEPTH_VS_FILTER_BASE <= filter_index < _YIHUAN_GBUFFER_VS_FILTER_BASE:
-                stage_name = "depth"
-            elif _YIHUAN_GBUFFER_VS_FILTER_BASE <= filter_index < _YIHUAN_GBUFFER_VS_FILTER_BASE + 100:
-                stage_name = "gbuffer"
-            else:
-                continue
-        if stage_name not in stage_filters or vs_hash not in known_hashes[stage_name]:
-            continue
-        stage_filters[stage_name][vs_hash] = filter_index
-    return stage_filters
-
-
-def _append_yihuan_vs_stage_filters(
-    lines: list[str],
-    stage_filters: dict[str, dict[str, int]],
-    *,
-    resource_suffix: str,
-):
-    lines.extend(
-        [
-            "; MARK: VS stage filters.",
-            "; These ShaderOverrides make 3DMigoto check the currently bound IB against the",
-            "; TextureOverride_IB_* sections below. The actual draw selection is still done",
-            "; by hash + match_first_index + match_index_count in those TextureOverrides.",
-        ]
-    )
-    for stage_name, label in (("depth", "DepthVS"), ("gbuffer", "GBufferVS")):
-        for vs_hash, filter_index in sorted(stage_filters[stage_name].items(), key=lambda item: item[1]):
-            lines.extend(
-                [
-                    f"[ShaderOverride_Yihuan_{resource_suffix}_{label}_{vs_hash[:8]}]",
-                    f"hash = {vs_hash}",
-                    f"filter_index = {filter_index}",
-                    "allow_duplicate_hash = overrule",
-                    "checktextureoverride = ib",
-                    "",
-                ]
-            )
-
 def _draw_toggle_for_draw(draw: dict[str, object]) -> tuple[str, str] | None:
     explicit_name = str(draw.get("draw_toggle", "") or "").strip()
     explicit_key = str(draw.get("draw_toggle_key", "") or "").strip()
@@ -1539,30 +1337,65 @@ def _yihuan_uses_default_body_textures(parts: list[dict[str, object]]) -> bool:
     return False
 
 
-def _append_yihuan_default_texture_sections(
-    lines: list[str],
-    parts: list[dict[str, object]],
-    *,
-    resource_suffix: str,
-):
-    if not _yihuan_uses_default_body_textures(parts):
-        return
-    for resource_name, filename in _YIHUAN_BODY_TEXTURE_RESOURCES:
-        lines.extend([f"[{_yihuan_texture_resource(resource_suffix, resource_name)}]", f"filename = {filename}"])
-    lines.append("")
-
-
 def _key_section_suffix(variable_name: str) -> str:
     chunks = re.split(r"[^0-9A-Za-z]+", variable_name.strip("$"))
     return "".join(chunk[:1].upper() + chunk[1:] for chunk in chunks if chunk) or "DrawToggle"
 
 
-def _append_yihuan_draw_toggle_sections(
-    lines: list[str],
-    parts: list[dict[str, object]],
-    *,
-    resource_suffix: str,
-):
+def _ntmi_part_resource(part: dict[str, object], role: str) -> str:
+    return f"ResourcePart_{part['resource_token']}_{role}"
+
+
+def _ntmi_palette_resource(part: dict[str, object]) -> str:
+    return f"ResourcePalette_{part['resource_token']}"
+
+
+def _ntmi_collector_config(
+    source_collection: bpy.types.Collection,
+    region_packages: list[dict[str, object]],
+) -> dict[str, str]:
+    contracts = [dict(package.get("runtime_contract", {})) for package in region_packages]
+
+    def first_contract_value(key: str, default: str = "") -> str:
+        for contract in contracts:
+            value = str(contract.get(key, "") or "").strip()
+            if value:
+                return value
+        return default
+
+    return {
+        "group_slot": _optional_str_collection_prop(source_collection, _COLLECTOR_GROUP_SLOT_PROP)
+        or first_contract_value("collector_group_slot", _NTMI_DEFAULT_COLLECTOR_GROUP_SLOT),
+        "match_cs_t0_hash": _optional_str_collection_prop(source_collection, _COLLECTOR_T0_HASH_PROP)
+        or first_contract_value("collector_t0_hash", first_contract_value("producer_t0_hash", _NTMI_DEFAULT_COLLECTOR_T0_HASH)),
+        "match_cs_u0_hash": _optional_str_collection_prop(source_collection, _COLLECTOR_U0_HASH_PROP)
+        or first_contract_value("collector_u0_hash", _NTMI_DEFAULT_COLLECTOR_U0_HASH),
+        "match_cs_u1_hash": _optional_str_collection_prop(source_collection, _COLLECTOR_U1_HASH_PROP)
+        or first_contract_value("collector_u1_hash", _NTMI_DEFAULT_COLLECTOR_U1_HASH),
+        "collect_key": _optional_str_collection_prop(source_collection, _COLLECTOR_COLLECT_KEY_PROP)
+        or first_contract_value("collector_collect_key", _NTMI_DEFAULT_COLLECT_KEY),
+        "finish_condition": _optional_str_collection_prop(source_collection, _COLLECTOR_FINISH_CONDITION_PROP)
+        or first_contract_value("collector_finish_condition", _NTMI_DEFAULT_FINISH_CONDITION),
+    }
+
+
+def _ntmi_region_match_hash(package: dict[str, object], key: str, default: str) -> str:
+    runtime_contract = dict(package.get("runtime_contract", {}))
+    value = str(runtime_contract.get(key, "") or "").strip().lower()
+    if value:
+        return value
+    return default
+
+
+def _append_ntmi_texture_sections(lines: list[str], parts: list[dict[str, object]]):
+    if not _yihuan_uses_default_body_textures(parts):
+        return
+    for resource_name, filename in _YIHUAN_BODY_TEXTURE_RESOURCES:
+        lines.extend([f"[{resource_name}]", f"filename = {filename}"])
+    lines.append("")
+
+
+def _append_ntmi_draw_toggle_sections(lines: list[str], parts: list[dict[str, object]], *, source_suffix: str):
     toggles = _yihuan_draw_toggles(parts)
     if not toggles:
         return
@@ -1573,7 +1406,7 @@ def _append_yihuan_draw_toggle_sections(
     for variable_name, key_name in sorted(toggles.items()):
         lines.extend(
             [
-                f"[KeyYihuan_{resource_suffix}_Toggle{_key_section_suffix(variable_name)}]",
+                f"[KeyNTMI_{source_suffix}_Toggle{_key_section_suffix(variable_name)}]",
                 f"key = no_modifiers {key_name}",
                 "type = cycle",
                 "smart = true",
@@ -1583,743 +1416,207 @@ def _append_yihuan_draw_toggle_sections(
         )
 
 
-def _yihuan_body_texture_lines_for_draw(
-    draw: dict[str, object],
-    *,
-    normalized_vs_hash: str,
-    filter_index: int | None,
-    resource_suffix: str,
-) -> list[str]:
-    object_name = str(draw.get("object_name", "")).lower()
-    if "body" not in object_name:
-        return []
-    # In this profile, the visible body material restore is needed on the 90e5
-    # GBuffer/velocity pass. Other passes should keep the caller's PS bindings.
-    if normalized_vs_hash != "90e5f30bc8bfe0ae" and filter_index != 4210:
-        return []
-    return [
-        f"  ps-t5 = {_yihuan_texture_resource(resource_suffix, 'ResourceT5')}",
-        f"  ps-t7 = {_yihuan_texture_resource(resource_suffix, 'ResourceT7')}",
-        f"  ps-t8 = {_yihuan_texture_resource(resource_suffix, 'ResourceT8')}",
-        f"  ps-t18 = {_yihuan_texture_resource(resource_suffix, 'ResourceT18')}",
-    ]
-
-
-def _part_draw_lines(
-    part: dict[str, object],
-    *,
-    normalized_vs_hash: str = "",
-    filter_index: int | None = None,
-    resource_suffix: str,
-) -> list[str]:
-    lines = []
-    for draw in part["draws"]:
-        lines.extend(
-            _yihuan_body_texture_lines_for_draw(
-                draw,
-                normalized_vs_hash=normalized_vs_hash,
-                filter_index=filter_index,
-                resource_suffix=resource_suffix,
-            )
-        )
-        lines.append(f"  ; [mesh:{draw['object_name']}] [vertex_count:{draw['vertex_count']}]")
-        draw_line = f"drawindexed = {draw['index_count']},{draw['first_index']},0"
-        toggle = _draw_toggle_for_draw(draw)
-        if toggle is None:
-            lines.append(f"  {draw_line}")
-        else:
-            variable_name, _ = toggle
-            lines.append(f"  if ${variable_name} == 1")
-            lines.append(f"    {draw_line}")
-            lines.append("  endif")
-    return lines
-
-
-def _append_part_stage_draw(
-    lines: list[str],
-    *,
-    part: dict[str, object],
-    stage: str,
-    use_runtime_skin: bool,
-    filter_index: int | None = None,
-    vs_hash: str | None = None,
-    resource_suffix: str,
-):
-    part_token = str(part["resource_token"])
-    normalized_vs_hash = (vs_hash or "").strip().lower()
-    if stage == "depth":
-        if use_runtime_skin:
-            lines.extend(
-                [
-                    f"  ; [depth part:{part['part_name']}] [vertex_count:{part['vertex_count']}]",
-                    f"  ib = ResourceYihuan_{part_token}_IB",
-                    f"  run = CommandList_YihuanSelectAndPublishPose_{part_token}",
-                    f"  vs-t3 = ResourceYihuan_{part_token}_Texcoord",
-                    f"  vs-t4 = ResourceYihuan_{part_token}_Position",
-                    f"  vs-t5 = ResourceYihuan_{part_token}_RuntimeSkinnedNormal",
-                ]
-            )
-        else:
-            lines.extend(
-                [
-                    f"  ; [depth-static part:{part['part_name']}] [vertex_count:{part['vertex_count']}]",
-                    f"  ib = ResourceYihuan_{part_token}_IB",
-                    f"  vb0 = ResourceYihuan_{part_token}_PositionVB",
-                    f"  vs-t3 = ResourceYihuan_{part_token}_Texcoord",
-                    f"  vs-t4 = ResourceYihuan_{part_token}_Position",
-                    f"  vs-t5 = ResourceYihuan_{part_token}_Normal",
-                ]
-            )
-    else:
-        if use_runtime_skin:
-            lines.extend(
-                [
-                    f"  ; [gbuffer part:{part['part_name']}] [vertex_count:{part['vertex_count']}]",
-                    f"  ib = ResourceYihuan_{part_token}_IB",
-                    f"  run = CommandList_YihuanSelectAndPublishPose_{part_token}",
-                ]
-            )
-            if normalized_vs_hash == "83b4d27352a7b440":
-                lines.extend(
-                    [
-                        f"  vs-t3 = ResourceYihuan_{part_token}_Texcoord",
-                        f"  vs-t4 = ResourceYihuan_{part_token}_Position",
-                        f"  vs-t5 = ResourceYihuan_{part_token}_RuntimeSkinnedNormal",
-                        f"  vs-t6 = ResourceYihuan_{part_token}_OutlineParam",
-                    ]
-                )
-            else:
-                skinned_position_resource = (
-                    f"ResourceYihuan_{part_token}_RuntimePrevSkinnedPosition"
-                    if normalized_vs_hash in {"90e5f30bc8bfe0ae", "95c1180ad8070a67"} or filter_index in {4202, 4203}
-                    else f"ResourceYihuan_{part_token}_RuntimeSkinnedPosition"
-                )
-                lines.extend(
-                    [
-                        f"  vs-t4 = {skinned_position_resource}",
-                        f"  vs-t5 = ResourceYihuan_{part_token}_Texcoord",
-                        f"  vs-t6 = ResourceYihuan_{part_token}_Position",
-                        f"  vs-t7 = ResourceYihuan_{part_token}_RuntimeSkinnedNormal",
-                    ]
-                )
-                if normalized_vs_hash == "95c1180ad8070a67":
-                    lines.append(f"  vs-t8 = ResourceYihuan_{part_token}_OutlineParam")
-        else:
-            lines.extend(
-                [
-                    f"  ; [gbuffer-static part:{part['part_name']}] [vertex_count:{part['vertex_count']}]",
-                    f"  ib = ResourceYihuan_{part_token}_IB",
-                    f"  vb0 = ResourceYihuan_{part_token}_PositionVB",
-                    f"  vs-t4 = ResourceYihuan_{part_token}_Position",
-                    f"  vs-t5 = ResourceYihuan_{part_token}_Texcoord",
-                    f"  vs-t6 = ResourceYihuan_{part_token}_Position",
-                    f"  vs-t7 = ResourceYihuan_{part_token}_Normal",
-                ]
-            )
-    lines.extend(
-        _part_draw_lines(
-            part,
-            normalized_vs_hash=normalized_vs_hash,
-            filter_index=filter_index,
-            resource_suffix=resource_suffix,
-        )
-    )
-
-
-def _append_yihuan_main_resource_sections(
-    lines: list[str],
-    parts: list[dict[str, object]],
-    *,
-    source_collection: bpy.types.Collection | None = None,
-    resource_suffix: str,
-):
-    max_vertex_count = max((int(part["vertex_count"]) for part in parts), default=1)
-    max_palette_count = max((int(part["local_palette_count"]) for part in parts), default=1)
-    max_global_bone = _global_bone_count(parts, source_collection)
-    pose_slots = 16
-    global_t0_rows = max(1, max_global_bone * 3)
-    lines.extend(
-        [
-            "; MARK: Original binding restore slots",
-            f"[{_yihuan_restore_resource(resource_suffix, 'IB')}]",
-            f"[{_yihuan_restore_resource(resource_suffix, 'VB0')}]",
-            f"[{_yihuan_restore_resource(resource_suffix, 'VST3')}]",
-            f"[{_yihuan_restore_resource(resource_suffix, 'VST4')}]",
-            f"[{_yihuan_restore_resource(resource_suffix, 'VST5')}]",
-            f"[{_yihuan_restore_resource(resource_suffix, 'VST6')}]",
-            f"[{_yihuan_restore_resource(resource_suffix, 'VST7')}]",
-            f"[{_yihuan_restore_resource(resource_suffix, 'VST8')}]",
-            f"[{_yihuan_restore_resource(resource_suffix, 'PST5')}]",
-            f"[{_yihuan_restore_resource(resource_suffix, 'PST6')}]",
-            f"[{_yihuan_restore_resource(resource_suffix, 'PST7')}]",
-            f"[{_yihuan_restore_resource(resource_suffix, 'PST8')}]",
-            f"[{_yihuan_restore_resource(resource_suffix, 'PST18')}]",
-            f"[{_yihuan_restore_resource(resource_suffix, 'CSCB0')}]",
-            f"[{_yihuan_restore_resource(resource_suffix, 'CST0')}]",
-            f"[{_yihuan_restore_resource(resource_suffix, 'CST1')}]",
-            f"[{_yihuan_restore_resource(resource_suffix, 'CST2')}]",
-            f"[{_yihuan_restore_resource(resource_suffix, 'CST3')}]",
-            f"[{_yihuan_restore_resource(resource_suffix, 'CST6')}]",
-            f"[{_yihuan_restore_resource(resource_suffix, 'CST7')}]",
-            f"[{_yihuan_restore_resource(resource_suffix, 'CSU0')}]",
-            f"[{_yihuan_restore_resource(resource_suffix, 'CSU1')}]",
-            f"[{_yihuan_restore_resource(resource_suffix, 'CSU2')}]",
-            "",
-        ]
-    )
-    _append_yihuan_default_texture_sections(lines, parts, resource_suffix=resource_suffix)
-    _append_yihuan_draw_toggle_sections(lines, parts, resource_suffix=resource_suffix)
-    lines.extend(
-        [
-            "; MARK: Shared runtime buffers",
-            f"[{_yihuan_runtime_resource(resource_suffix, 'PoseState_UAV')}]",
-            "type = RWBuffer",
-            "format = R32_UINT",
-            "array = 64",
-            "",
-            f"[{_yihuan_runtime_resource(resource_suffix, 'PoseFeature_UAV')}]",
-            "type = RWBuffer",
-            "format = R32_FLOAT",
-            "array = 12288",
-            "",
-            f"[{_yihuan_runtime_resource(resource_suffix, 'PoseFeature')}]",
-            "type = Buffer",
-            "format = R32_FLOAT",
-            "array = 12288",
-            "",
-            f"[{_yihuan_runtime_resource(resource_suffix, 'NativeFeaturePosition')}]",
-            "type = Buffer",
-            "format = R32_FLOAT",
-            f"array = {max_vertex_count * 3}",
-            "",
-            f"[{_yihuan_runtime_resource(resource_suffix, 'PoseGlobalT0_UAV')}]",
-            "type = RWStructuredBuffer",
-            "stride = 16",
-            f"array = {pose_slots * global_t0_rows}",
-            "",
-            f"[{_yihuan_runtime_resource(resource_suffix, 'PoseGlobalT0')}]",
-            "type = StructuredBuffer",
-            "stride = 16",
-            f"array = {pose_slots * global_t0_rows}",
-            "",
-            f"[{_yihuan_runtime_resource(resource_suffix, 'PoseSelectedLocalT0_UAV')}]",
-            "type = RWStructuredBuffer",
-            "stride = 16",
-            f"array = {max_palette_count * 3}",
-            "",
-            f"[{_yihuan_runtime_resource(resource_suffix, 'PoseSelectedLocalT0')}]",
-            "type = StructuredBuffer",
-            "stride = 16",
-            f"array = {max_palette_count * 3}",
-            "",
-        ]
-    )
-    for part in parts:
+def _append_ntmi_resource_sections(lines: list[str], parts: list[dict[str, object]]):
+    for part in sorted(parts, key=lambda item: str(item["resource_token"])):
         token = str(part["resource_token"])
+        buffers = dict(part["buffers"])
         vertex_count = int(part["vertex_count"])
-        buffers = part["buffers"]
+        position_float_count = vertex_count * 3
+        normal_row_count = vertex_count * 2
+        dynamic_slots = int(part.get("dynamic_slots") or _NTMI_DEFAULT_DYNAMIC_SLOTS)
+
         lines.extend(
             [
+                f"[{_ntmi_palette_resource(part)}]",
+                "type = Buffer",
+                "format = R32_UINT",
+                f"filename = Buffer/{part['expected_palette_file']}",
+                "",
                 f"; [part:{part['part_name']}]",
-                f"[ResourceYihuan_{token}_RuntimeSkinnedPosition_UAV]",
+                f"[{_ntmi_part_resource(part, 'RuntimeSkinnedPosition_UAV')}]",
+                f"dynamic_slots = {dynamic_slots}",
                 "type = RWBuffer",
                 "format = R32_FLOAT",
-                f"array = {vertex_count * 3}",
+                f"array = {position_float_count}",
                 "",
-                f"[ResourceYihuan_{token}_RuntimeSkinnedPosition]",
+                f"[{_ntmi_part_resource(part, 'RuntimeSkinnedPosition')}]",
+                f"dynamic_slots = {dynamic_slots}",
                 "type = Buffer",
                 "format = R32_FLOAT",
-                f"array = {vertex_count * 3}",
                 "",
-                f"[ResourceYihuan_{token}_RuntimeSkinnedPositionVB]",
+                f"[{_ntmi_part_resource(part, 'RuntimeSkinnedPositionVB')}]",
+                f"dynamic_slots = {dynamic_slots}",
                 "type = Buffer",
                 "stride = 12",
                 "",
-                f"[ResourceYihuan_{token}_RuntimeSkinnedNormal_UAV]",
+                f"[{_ntmi_part_resource(part, 'RuntimeSkinnedNormal_UAV')}]",
+                f"dynamic_slots = {dynamic_slots}",
                 "type = RWBuffer",
                 "format = R16G16B16A16_SNORM",
-                f"array = {vertex_count * 2}",
+                f"array = {normal_row_count}",
                 "",
-                f"[ResourceYihuan_{token}_RuntimeSkinnedNormal]",
+                f"[{_ntmi_part_resource(part, 'RuntimeSkinnedNormal')}]",
+                f"dynamic_slots = {dynamic_slots}",
                 "type = Buffer",
                 "format = R16G16B16A16_SNORM",
-                f"array = {vertex_count * 2}",
                 "",
-                f"[ResourceYihuan_{token}_RuntimeScratchPosition_UAV]",
-                "type = RWBuffer",
-                "format = R32_FLOAT",
-                f"array = {vertex_count * 3}",
-                "",
-                f"[ResourceYihuan_{token}_RuntimeScratchPosition]",
+                f"[{_ntmi_part_resource(part, 'RuntimePrevSkinnedPosition')}]",
+                f"dynamic_slots = {dynamic_slots}",
+                f"dynamic_prev_of = {_ntmi_part_resource(part, 'RuntimeSkinnedPosition')}",
                 "type = Buffer",
                 "format = R32_FLOAT",
-                f"array = {vertex_count * 3}",
+                f"array = {position_float_count}",
                 "",
-                f"[ResourceYihuan_{token}_RuntimeScratchFrame_UAV]",
-                "type = RWBuffer",
-                "format = R16G16B16A16_SNORM",
-                f"array = {vertex_count * 2}",
-                "",
-                f"[ResourceYihuan_{token}_RuntimeScratchFrame]",
+                f"[{_ntmi_part_resource(part, 'IB')}]",
                 "type = Buffer",
-                "format = R16G16B16A16_SNORM",
-                f"array = {vertex_count * 2}",
-                "",
-                f"[ResourceYihuan_{token}_RuntimePoseSkinnedPosition_UAV]",
-                "type = RWBuffer",
-                "format = R32_FLOAT",
-                f"array = {pose_slots * vertex_count * 3}",
-                "",
-                f"[ResourceYihuan_{token}_RuntimePoseSkinnedPosition]",
-                "type = Buffer",
-                "format = R32_FLOAT",
-                f"array = {pose_slots * vertex_count * 3}",
-                "",
-                f"[ResourceYihuan_{token}_RuntimePoseSkinnedNormal_UAV]",
-                "type = RWBuffer",
-                "format = R16G16B16A16_SNORM",
-                f"array = {pose_slots * vertex_count * 2}",
-                "",
-                f"[ResourceYihuan_{token}_RuntimePoseSkinnedNormal]",
-                "type = Buffer",
-                "format = R16G16B16A16_SNORM",
-                f"array = {pose_slots * vertex_count * 2}",
-                "",
-                f"[ResourceYihuan_{token}_RuntimePrevSkinnedPosition]",
-                "type = Buffer",
-                "format = R32_FLOAT",
-                f"array = {vertex_count * 3}",
-                "",
-                f"[ResourceYihuan_{token}_IB]",
-                "type = Buffer",
-                "format = DXGI_FORMAT_R16_UINT",
+                f"format = {part.get('ib_format', 'DXGI_FORMAT_R16_UINT')}",
                 f"filename = Buffer/{buffers['ib']}",
                 "",
-                f"[ResourceYihuan_{token}_Position]",
+                f"[{_ntmi_part_resource(part, 'Position')}]",
                 "type = Buffer",
                 "format = R32_FLOAT",
-                f"array = {vertex_count * 3}",
                 f"filename = Buffer/{buffers['vb0_pre_cs']}",
                 "",
-                f"[ResourceYihuan_{token}_PositionVB]",
+                f"[{_ntmi_part_resource(part, 'PositionVB')}]",
                 "type = Buffer",
                 "stride = 12",
                 f"filename = Buffer/{buffers['vb0_pre_cs']}",
                 "",
-                f"[ResourceYihuan_{token}_F33Position]",
+                f"[{_ntmi_part_resource(part, 'F33Position')}]",
                 "type = Buffer",
                 "format = R32_FLOAT",
-                f"array = {vertex_count * 3}",
                 f"filename = Buffer/{buffers['vb0_pre_cs']}",
                 "",
-                f"[ResourceYihuan_{token}_Blend]",
+                f"[{_ntmi_part_resource(part, 'Blend')}]",
                 "type = StructuredBuffer",
                 "stride = 8",
                 f"filename = Buffer/{buffers['weights']}",
                 "",
-                f"[ResourceYihuan_{token}_BlendTyped]",
+                f"[{_ntmi_part_resource(part, 'BlendTyped')}]",
                 "type = Buffer",
                 "format = R32_UINT",
-                f"array = {vertex_count * 2}",
                 f"filename = Buffer/{buffers['weights']}",
                 "",
-                f"[ResourceYihuan_{token}_PreFrame]",
+                f"[{_ntmi_part_resource(part, 'PreFrame')}]",
                 "type = StructuredBuffer",
                 "stride = 8",
                 f"filename = Buffer/{buffers['frame_pre_cs']}",
                 "",
-                f"[ResourceYihuan_{token}_F33Frame]",
+                f"[{_ntmi_part_resource(part, 'F33Frame')}]",
                 "type = Buffer",
                 "format = R8G8B8A8_SNORM",
-                f"array = {vertex_count * 2}",
                 f"filename = Buffer/{buffers['frame_pre_cs']}",
                 "",
-                f"[ResourceYihuan_{token}_Normal]",
+                f"[{_ntmi_part_resource(part, 'Normal')}]",
                 "type = Buffer",
                 "format = R8G8B8A8_SNORM",
-                f"array = {vertex_count * 2}",
                 f"filename = Buffer/{buffers['frame_pre_cs']}",
                 "",
-                f"[ResourceYihuan_{token}_Texcoord]",
+                f"[{_ntmi_part_resource(part, 'Texcoord')}]",
                 "type = Buffer",
                 "format = R16G16_FLOAT",
-                f"array = {vertex_count * 4}",
                 f"filename = Buffer/{buffers['packed_uv']}",
                 "",
-                f"[ResourceYihuan_{token}_OutlineParam]",
+                f"[{_ntmi_part_resource(part, 'OutlineParam')}]",
                 "type = Buffer",
                 "format = R8G8B8A8_UNORM",
-                f"array = {vertex_count}",
                 f"filename = Buffer/{buffers['outline_param']}",
                 "",
-                f"[ResourceYihuan_{token}_CB0]",
-                "type = Buffer",
-                "stride = 16",
-                "format = R32G32B32A32_UINT",
-                f"filename = Buffer/{buffers['skin_cb0']}",
-                "",
-                f"[ResourceYihuan_{token}_SkinnedPosition_UAV]",
-                "type = RWBuffer",
-                "format = R32_FLOAT",
-                f"array = {vertex_count * 3}",
-                "",
-                f"[ResourceYihuan_{token}_SkinnedPosition]",
-                "type = Buffer",
-                "format = R32_FLOAT",
-                f"array = {vertex_count * 3}",
-                "",
-                f"[ResourceYihuan_{token}_SkinnedPositionVB]",
-                "type = Buffer",
-                "stride = 12",
-                "",
-                f"[ResourceYihuan_{token}_SkinnedNormal_UAV]",
-                "type = RWBuffer",
-                "format = R16G16B16A16_SNORM",
-                f"array = {vertex_count * 2}",
-                "",
-                f"[ResourceYihuan_{token}_SkinnedNormal]",
-                "type = Buffer",
-                "format = R16G16B16A16_SNORM",
-                f"array = {vertex_count * 2}",
-                "",
             ]
         )
 
 
-def _append_yihuan_bonestore_resource_sections(
-    lines: list[str],
-    parts: list[dict[str, object]],
-    *,
-    source_collection: bpy.types.Collection | None = None,
-):
-    character_meta_rows = max(1, len(_character_meta_rows(parts, source_collection)))
-    palette_table_entries = max(1, sum(len(part.get("palette_entries", [])) for part in parts))
-    lines.extend(
-        [
-            "; MARK: Shared bone store resources",
-            "[ResourceGlobalT0Store_UAV]",
-            "type = RWStructuredBuffer",
-            "stride = 16",
-            "array = 4096",
-            "",
-            "[ResourceGlobalT0Store]",
-            "type = StructuredBuffer",
-            "stride = 16",
-            "array = 4096",
-            "",
-            "[ResourceCharacterMetaTable]",
-            "type = Buffer",
-            "format = R32G32B32A32_UINT",
-            f"array = {character_meta_rows}",
-            "filename = BoneStore/Buffer/CharacterMetaTable.buf",
-            "",
-            "[ResourcePaletteTable]",
-            "type = Buffer",
-            "format = R32_UINT",
-            f"array = {palette_table_entries}",
-            "filename = BoneStore/Buffer/PaletteTable.buf",
-            "",
-        ]
-    )
-    for part in parts:
-        token = str(part["resource_token"])
-        lines.extend(
-            [
-                f"[ResourcePalette_{token}]",
-                "type = Buffer",
-                "format = R32_UINT",
-                f"filename = BoneStore/Buffer/{part['expected_palette_file']}",
-                "",
-            ]
-        )
-
-
-def _write_yihuan_bonestore_tables(
-    *,
-    export_root: Path,
-    parts: list[dict[str, object]],
-    source_collection: bpy.types.Collection | None = None,
-) -> Path:
-    buffer_dir = _ensure_directory(export_root / "BoneStore" / "Buffer")
-    character_meta: list[int] = []
-    palette_table: list[int] = []
-    palette_offset = 0
-    for part in parts:
-        palette_entries = [int(value) for value in part.get("palette_entries", [])]
-        palette_table.extend(palette_entries)
-        palette_offset += len(palette_entries)
-        write_u32_buffer(str(buffer_dir / str(part["expected_palette_file"])), palette_entries)
-    for row in _character_meta_rows(parts, source_collection):
-        character_meta.extend([int(value) for value in row])
-    if not palette_table:
-        palette_table = [0]
-    write_u32_buffer(str(buffer_dir / "CharacterMetaTable.buf"), character_meta)
-    write_u32_buffer(str(buffer_dir / "PaletteTable.buf"), palette_table)
-    return buffer_dir
-
-
-def _append_yihuan_custom_shader_sections(
+def _append_ntmi_collector(
     lines: list[str],
     *,
     source_suffix: str,
-    hlsl_suffix: str,
+    source_collection: bpy.types.Collection,
+    region_packages: list[dict[str, object]],
     parts: list[dict[str, object]],
-    bonestore_namespace: str,
 ):
-    max_vertex_count = max((int(part["vertex_count"]) for part in parts), default=1)
-    max_palette_count = max((int(part["local_palette_count"]) for part in parts), default=1)
-    skin_dispatch = _ceil_div(max_vertex_count, 64)
-    palette_dispatch = _ceil_div(max_palette_count * 3, 64)
+    collector = _ntmi_collector_config(source_collection, region_packages)
     lines.extend(
         [
-            f"[CustomShader_YihuanClearPoseSlots_{source_suffix}]",
-            f"cs = hlsl\\yihuan_clear_pose_slots_{hlsl_suffix}_cs.hlsl",
-            f"cs-u0 = {_yihuan_runtime_resource(source_suffix, 'PoseState_UAV')}",
-            "dispatch = 1, 1, 1",
-            "",
-            f"[CustomShader_YihuanFindOrAllocPoseSlot_{source_suffix}]",
-            f"cs = hlsl\\yihuan_find_or_alloc_pose_slot_{hlsl_suffix}_cs.hlsl",
-            f"cs-cb0 = reference {_yihuan_restore_resource(source_suffix, 'CSCB0')}",
-            f"{_yihuan_runtime_resource(source_suffix, 'NativeFeaturePosition')} = copy {_yihuan_restore_resource(source_suffix, 'CSU1')}",
-            f"cs-t0 = {_yihuan_runtime_resource(source_suffix, 'NativeFeaturePosition')}",
-            f"cs-t2 = Resource\\{bonestore_namespace}\\CharacterMetaTable",
-            f"cs-u0 = {_yihuan_runtime_resource(source_suffix, 'PoseState_UAV')}",
-            f"cs-u1 = {_yihuan_runtime_resource(source_suffix, 'PoseFeature_UAV')}",
-            "dispatch = 1, 1, 1",
-            f"{_yihuan_runtime_resource(source_suffix, 'PoseFeature')} = copy {_yihuan_runtime_resource(source_suffix, 'PoseFeature_UAV')}",
-            "",
-            f"[CustomShader_YihuanSelectPoseSlot_{source_suffix}]",
-            f"cs = hlsl\\yihuan_select_pose_slot_{hlsl_suffix}_cs.hlsl",
-            f"cs-t0 = {_yihuan_restore_resource(source_suffix, 'VB0')}",
-            f"cs-t1 = {_yihuan_runtime_resource(source_suffix, 'PoseFeature')}",
-            f"cs-t2 = Resource\\{bonestore_namespace}\\CharacterMetaTable",
-            f"cs-u0 = {_yihuan_runtime_resource(source_suffix, 'PoseState_UAV')}",
-            "dispatch = 1, 1, 1",
-            "",
-            f"[CustomShader_YihuanStoreGlobalT0PoseSlot_{source_suffix}]",
-            f"cs = BoneStore\\hlsl\\yihuan_store_global_t0_pose_slot_{hlsl_suffix}_cs.hlsl",
-            f"cs-cb0 = reference {_yihuan_restore_resource(source_suffix, 'CSCB0')}",
-            f"cs-t0 = reference {_yihuan_restore_resource(source_suffix, 'CST0')}",
-            f"cs-t1 = Resource\\{bonestore_namespace}\\CharacterMetaTable",
-            f"cs-u0 = {_yihuan_runtime_resource(source_suffix, 'PoseState_UAV')}",
-            f"cs-u1 = {_yihuan_runtime_resource(source_suffix, 'PoseGlobalT0_UAV')}",
-            "dispatch = 64, 1, 1",
-            f"{_yihuan_runtime_resource(source_suffix, 'PoseGlobalT0')} = copy {_yihuan_runtime_resource(source_suffix, 'PoseGlobalT0_UAV')}",
-            "",
-            f"[CustomShader_YihuanBuildLocalT0PoseSlot_{source_suffix}]",
-            f"cs = BoneStore\\hlsl\\yihuan_build_local_t0_pose_slot_{hlsl_suffix}_cs.hlsl",
-            f"cs-t0 = {_yihuan_runtime_resource(source_suffix, 'PoseGlobalT0')}",
-            f"cs-t2 = Resource\\{bonestore_namespace}\\CharacterMetaTable",
-            f"cs-u0 = {_yihuan_runtime_resource(source_suffix, 'PoseState_UAV')}",
-            f"cs-u1 = {_yihuan_runtime_resource(source_suffix, 'PoseSelectedLocalT0_UAV')}",
-            f"dispatch = {palette_dispatch}, 1, 1",
-            f"{_yihuan_runtime_resource(source_suffix, 'PoseSelectedLocalT0')} = copy {_yihuan_runtime_resource(source_suffix, 'PoseSelectedLocalT0_UAV')}",
-            "",
-            f"[CustomShader_YihuanSkinScratch_{source_suffix}]",
-            f"cs = BoneStore\\hlsl\\yihuan_skin_scratch_{hlsl_suffix}_cs.hlsl",
-            f"cs-t0 = {_yihuan_runtime_resource(source_suffix, 'PoseSelectedLocalT0')}",
-            f"cs-u2 = {_yihuan_runtime_resource(source_suffix, 'PoseState_UAV')}",
-            f"dispatch = {skin_dispatch}, 1, 1",
-            "",
-            f"[CustomShader_YihuanStoreScratchPoseSlot_{source_suffix}]",
-            f"cs = hlsl\\yihuan_store_scratch_pose_slot_{hlsl_suffix}_cs.hlsl",
-            f"cs-t2 = Resource\\{bonestore_namespace}\\CharacterMetaTable",
-            f"cs-u0 = {_yihuan_runtime_resource(source_suffix, 'PoseState_UAV')}",
-            f"dispatch = {skin_dispatch}, 1, 1",
-            "",
-            f"[CustomShader_YihuanPublishPoseSlot_{source_suffix}]",
-            f"cs = hlsl\\yihuan_publish_pose_slot_{hlsl_suffix}_cs.hlsl",
-            f"cs-t2 = Resource\\{bonestore_namespace}\\CharacterMetaTable",
-            f"cs-u0 = {_yihuan_runtime_resource(source_suffix, 'PoseState_UAV')}",
-            f"dispatch = {skin_dispatch}, 1, 1",
-            "",
-            "[Present]",
-            f"post run = CommandList_YihuanCapturePrevSkinnedPositions_{source_suffix}",
-            f"post run = CustomShader_YihuanClearPoseSlots_{source_suffix}",
-            "",
-            f"[CommandList_YihuanStoreResourceSlots_{source_suffix}]",
-            f"{_yihuan_restore_resource(source_suffix, 'IB')} = reference ib",
-            f"{_yihuan_restore_resource(source_suffix, 'VB0')} = reference vb0",
-            f"{_yihuan_restore_resource(source_suffix, 'VST3')} = reference vs-t3",
-            f"{_yihuan_restore_resource(source_suffix, 'VST4')} = reference vs-t4",
-            f"{_yihuan_restore_resource(source_suffix, 'VST5')} = reference vs-t5",
-            f"{_yihuan_restore_resource(source_suffix, 'VST6')} = reference vs-t6",
-            f"{_yihuan_restore_resource(source_suffix, 'VST7')} = reference vs-t7",
-            f"{_yihuan_restore_resource(source_suffix, 'VST8')} = reference vs-t8",
-            f"{_yihuan_restore_resource(source_suffix, 'PST5')} = reference ps-t5",
-            f"{_yihuan_restore_resource(source_suffix, 'PST6')} = reference ps-t6",
-            f"{_yihuan_restore_resource(source_suffix, 'PST7')} = reference ps-t7",
-            f"{_yihuan_restore_resource(source_suffix, 'PST8')} = reference ps-t8",
-            f"{_yihuan_restore_resource(source_suffix, 'PST18')} = reference ps-t18",
-            f"{_yihuan_restore_resource(source_suffix, 'CSCB0')} = reference cs-cb0",
-            f"{_yihuan_restore_resource(source_suffix, 'CST0')} = reference cs-t0",
-            f"{_yihuan_restore_resource(source_suffix, 'CST1')} = reference cs-t1",
-            f"{_yihuan_restore_resource(source_suffix, 'CST2')} = reference cs-t2",
-            f"{_yihuan_restore_resource(source_suffix, 'CST3')} = reference cs-t3",
-            f"{_yihuan_restore_resource(source_suffix, 'CST6')} = reference cs-t6",
-            f"{_yihuan_restore_resource(source_suffix, 'CST7')} = reference cs-t7",
-            f"{_yihuan_restore_resource(source_suffix, 'CSU0')} = reference cs-u0",
-            f"{_yihuan_restore_resource(source_suffix, 'CSU1')} = reference cs-u1",
-            f"{_yihuan_restore_resource(source_suffix, 'CSU2')} = reference cs-u2",
-            "",
-            f"[CommandList_YihuanRestoreResourceSlots_{source_suffix}]",
-            f"ib = reference {_yihuan_restore_resource(source_suffix, 'IB')}",
-            f"vb0 = reference {_yihuan_restore_resource(source_suffix, 'VB0')}",
-            f"vs-t3 = reference {_yihuan_restore_resource(source_suffix, 'VST3')}",
-            f"vs-t4 = reference {_yihuan_restore_resource(source_suffix, 'VST4')}",
-            f"vs-t5 = reference {_yihuan_restore_resource(source_suffix, 'VST5')}",
-            f"vs-t6 = reference {_yihuan_restore_resource(source_suffix, 'VST6')}",
-            f"vs-t7 = reference {_yihuan_restore_resource(source_suffix, 'VST7')}",
-            f"vs-t8 = reference {_yihuan_restore_resource(source_suffix, 'VST8')}",
-            f"ps-t5 = reference {_yihuan_restore_resource(source_suffix, 'PST5')}",
-            f"ps-t6 = reference {_yihuan_restore_resource(source_suffix, 'PST6')}",
-            f"ps-t7 = reference {_yihuan_restore_resource(source_suffix, 'PST7')}",
-            f"ps-t8 = reference {_yihuan_restore_resource(source_suffix, 'PST8')}",
-            f"ps-t18 = reference {_yihuan_restore_resource(source_suffix, 'PST18')}",
-            f"cs-cb0 = reference {_yihuan_restore_resource(source_suffix, 'CSCB0')}",
-            f"cs-t0 = reference {_yihuan_restore_resource(source_suffix, 'CST0')}",
-            f"cs-t1 = reference {_yihuan_restore_resource(source_suffix, 'CST1')}",
-            f"cs-t2 = reference {_yihuan_restore_resource(source_suffix, 'CST2')}",
-            f"cs-t3 = reference {_yihuan_restore_resource(source_suffix, 'CST3')}",
-            f"cs-t6 = reference {_yihuan_restore_resource(source_suffix, 'CST6')}",
-            f"cs-t7 = reference {_yihuan_restore_resource(source_suffix, 'CST7')}",
-            f"cs-u0 = reference {_yihuan_restore_resource(source_suffix, 'CSU0')}",
-            f"cs-u1 = reference {_yihuan_restore_resource(source_suffix, 'CSU1')}",
-            f"cs-u2 = reference {_yihuan_restore_resource(source_suffix, 'CSU2')}",
+            "; MARK: Skin dispatch. Collector builds the current group BoneAtlas, then skins custom buffers.",
+            f"[CollectorSkinPart_{source_suffix}]",
+            f"group = {collector['group_slot']}",
+            f"match_cs_t0_hash = {collector['match_cs_t0_hash']}",
+            f"match_cs_u0_hash = {collector['match_cs_u0_hash']}",
+            f"match_cs_u1_hash = {collector['match_cs_u1_hash']}",
+            f"collect = write, cs-t0, {collector['collect_key']}",
+            f"if {collector['finish_condition']}",
+            f"  post collect = build, {_NTMI_CORE_GLOBAL_T0_RESOURCE}",
+        ]
+    )
+    for part in sorted(parts, key=lambda item: str(item["resource_token"])):
+        lines.append(
+            "  map = "
+            f"cs-u1:{_ntmi_part_resource(part, 'RuntimeSkinnedPosition')}, "
+            f"cs-u1:{_ntmi_part_resource(part, 'RuntimeSkinnedPositionVB')}, "
+            f"cs-u0:{_ntmi_part_resource(part, 'RuntimeSkinnedNormal')}"
+        )
+    lines.extend(
+        [
+            f"  post run = CommandList_SkinParts_{source_suffix}",
+            "endif",
             "",
         ]
     )
-    lines.extend([f"[CommandList_YihuanCapturePrevSkinnedPositions_{source_suffix}]"])
-    for part in parts:
-        token = str(part["resource_token"])
-        lines.append(
-            f"ResourceYihuan_{token}_RuntimePrevSkinnedPosition = copy "
-            f"ResourceYihuan_{token}_RuntimeSkinnedPosition_UAV"
-        )
-    lines.append("")
 
-    for part in parts:
-        token = str(part["resource_token"])
+
+def _append_ntmi_skin_commandlist(lines: list[str], *, source_suffix: str, parts: list[dict[str, object]]):
+    lines.extend([f"[CommandList_SkinParts_{source_suffix}]", f"cs-t64 = {_NTMI_CORE_GLOBAL_T0_RESOURCE}", ""])
+    for part in sorted(parts, key=lambda item: str(item["resource_token"])):
         lines.extend(
             [
-                f"[CommandList_YihuanSkinAndStore_{token}]",
-                f"cs-t1 = ResourceYihuan_{token}_BlendTyped",
-                f"cs-t2 = ResourceYihuan_{token}_F33Frame",
-                f"cs-t3 = ResourceYihuan_{token}_F33Position",
-                f"cs-u0 = ResourceYihuan_{token}_RuntimeScratchFrame_UAV",
-                f"cs-u1 = ResourceYihuan_{token}_RuntimeScratchPosition_UAV",
-                f"run = CustomShader_YihuanSkinScratch_{source_suffix}",
-                f"ResourceYihuan_{token}_RuntimeScratchFrame = copy ResourceYihuan_{token}_RuntimeScratchFrame_UAV",
-                f"ResourceYihuan_{token}_RuntimeScratchPosition = copy ResourceYihuan_{token}_RuntimeScratchPosition_UAV",
-                f"cs-t0 = ResourceYihuan_{token}_RuntimeScratchPosition",
-                f"cs-t1 = ResourceYihuan_{token}_RuntimeScratchFrame",
-                f"cs-u1 = ResourceYihuan_{token}_RuntimePoseSkinnedPosition_UAV",
-                f"cs-u2 = ResourceYihuan_{token}_RuntimePoseSkinnedNormal_UAV",
-                f"run = CustomShader_YihuanStoreScratchPoseSlot_{source_suffix}",
-                "",
-                f"[CommandList_YihuanSelectAndPublishPose_{token}]",
-                f"run = CustomShader_YihuanSelectPoseSlot_{source_suffix}",
-                f"ResourceYihuan_{token}_RuntimePoseSkinnedPosition = copy "
-                f"ResourceYihuan_{token}_RuntimePoseSkinnedPosition_UAV",
-                f"ResourceYihuan_{token}_RuntimePoseSkinnedNormal = copy "
-                f"ResourceYihuan_{token}_RuntimePoseSkinnedNormal_UAV",
-                f"cs-t0 = ResourceYihuan_{token}_RuntimePoseSkinnedPosition",
-                f"cs-t1 = ResourceYihuan_{token}_RuntimePoseSkinnedNormal",
-                f"cs-u1 = ResourceYihuan_{token}_RuntimeSkinnedPosition_UAV",
-                f"cs-u2 = ResourceYihuan_{token}_RuntimeSkinnedNormal_UAV",
-                f"run = CustomShader_YihuanPublishPoseSlot_{source_suffix}",
-                f"ResourceYihuan_{token}_RuntimeSkinnedPosition = copy ResourceYihuan_{token}_RuntimeSkinnedPosition_UAV",
-                f"ResourceYihuan_{token}_RuntimeSkinnedPositionVB = copy ResourceYihuan_{token}_RuntimeSkinnedPosition_UAV",
-                f"ResourceYihuan_{token}_RuntimeSkinnedNormal = copy ResourceYihuan_{token}_RuntimeSkinnedNormal_UAV",
-                f"vb0 = ResourceYihuan_{token}_RuntimeSkinnedPositionVB",
-                f"cs-t0 = reference {_yihuan_restore_resource(source_suffix, 'CST0')}",
-                f"cs-t1 = reference {_yihuan_restore_resource(source_suffix, 'CST1')}",
-                f"cs-t2 = reference {_yihuan_restore_resource(source_suffix, 'CST2')}",
-                f"cs-t3 = reference {_yihuan_restore_resource(source_suffix, 'CST3')}",
-                f"cs-u0 = reference {_yihuan_restore_resource(source_suffix, 'CSU0')}",
-                f"cs-u1 = reference {_yihuan_restore_resource(source_suffix, 'CSU1')}",
-                f"cs-u2 = reference {_yihuan_restore_resource(source_suffix, 'CSU2')}",
+                f"cs-t65 = {_ntmi_palette_resource(part)}",
+                f"{_NTMI_CORE_VERTEX_COUNT} = {int(part['vertex_count'])}",
+                f"cs-t1 = {_ntmi_part_resource(part, 'BlendTyped')}",
+                f"cs-t2 = {_ntmi_part_resource(part, 'F33Frame')}",
+                f"cs-t3 = {_ntmi_part_resource(part, 'F33Position')}",
+                f"cs-u0 = {_ntmi_part_resource(part, 'RuntimeSkinnedNormal_UAV')}",
+                f"cs-u1 = {_ntmi_part_resource(part, 'RuntimeSkinnedPosition_UAV')}",
+                f"run = {_NTMI_CORE_SKIN_COMMAND}",
+                f"{_ntmi_part_resource(part, 'RuntimeSkinnedPosition')} = copy {_ntmi_part_resource(part, 'RuntimeSkinnedPosition_UAV')}",
+                f"{_ntmi_part_resource(part, 'RuntimeSkinnedPositionVB')} = copy {_ntmi_part_resource(part, 'RuntimeSkinnedPosition_UAV')}",
+                f"{_ntmi_part_resource(part, 'RuntimeSkinnedNormal')} = copy {_ntmi_part_resource(part, 'RuntimeSkinnedNormal_UAV')}",
                 "",
             ]
         )
 
 
-def _write_yihuan_main_ini(
-    *,
-    export_root: Path,
-    ini_name: str,
-    source_collection: bpy.types.Collection,
-    region_packages: list[dict[str, object]],
-    include_runtime_skin: bool,
-) -> Path:
-    if not region_packages:
-        raise ValueError("Cannot generate INI without region packages.")
-    ini_path = export_root / ini_name
-    lines: list[str] = []
-    all_parts = [part for package in region_packages for part in package["parts"]]
-    stage_filters = _yihuan_stage_filters(source_collection, region_packages)
-    runtime_suffix = _yihuan_source_suffix(region_packages)
-    hlsl_suffix = _YIHUAN_RUNTIME_HLSL_SUFFIX
-    bonestore_namespace = _yihuan_bonestore_namespace(region_packages)
-    _append_yihuan_main_resource_sections(
-        lines,
-        all_parts,
-        source_collection=source_collection,
-        resource_suffix=runtime_suffix,
-    )
-    _append_yihuan_vs_stage_filters(lines, stage_filters, resource_suffix=runtime_suffix)
-    _append_yihuan_custom_shader_sections(
-        lines,
-        source_suffix=runtime_suffix,
-        hlsl_suffix=hlsl_suffix,
-        parts=all_parts,
-        bonestore_namespace=bonestore_namespace,
-    )
-    lines.append("")
-    if include_runtime_skin:
-        lines.append("; MARK: Skin dispatch. Main INI selects a pose slot and skins custom buffers.")
-        filter_condition = (
-            f"cs == {_YIHUAN_CS_FILTER_INDICES['f33fea3cca2704e4']} || "
-            f"cs == {_YIHUAN_CS_FILTER_INDICES['1e2a9061eadfeb6c']}"
-        )
-        parts_by_cb0: dict[str, list[dict[str, object]]] = defaultdict(list)
-        for part in sorted(all_parts, key=lambda item: (str(item["region_hash"]), int(item["part_index"]))):
-            last_cs_cb0_hash = str(part.get("last_cs_cb0_hash", "")).strip().lower()
-            if not last_cs_cb0_hash:
-                continue
-            parts_by_cb0[last_cs_cb0_hash].append(part)
-        for last_cs_cb0_hash, cb0_parts in sorted(parts_by_cb0.items()):
-            lines.extend(
-                [
-                    f"[TextureOverride_YihuanSkinPart_{runtime_suffix}_{last_cs_cb0_hash}]",
-                    f"hash = {last_cs_cb0_hash}",
-                    "match_priority = 500",
-                    f"if {filter_condition}",
-                    f"  run = CommandList_YihuanStoreResourceSlots_{runtime_suffix}",
-                    f"  post run = CustomShader_YihuanFindOrAllocPoseSlot_{runtime_suffix}",
-                    f"  post run = CustomShader_YihuanStoreGlobalT0PoseSlot_{runtime_suffix}",
-                ]
-            )
-            for part in cb0_parts:
-                token = str(part["resource_token"])
-                lines.extend(
-                    [
-                        f"  post cs-t1 = Resource\\{bonestore_namespace}\\Palette_{token}",
-                        f"  post run = CustomShader_YihuanBuildLocalT0PoseSlot_{runtime_suffix}",
-                        f"  post run = CommandList_YihuanSkinAndStore_{token}",
-                    ]
-                )
-            lines.extend(
-                [
-                    f"  post run = CommandList_YihuanRestoreResourceSlots_{runtime_suffix}",
-                    "endif",
-                    "",
-                ]
-            )
+def _ntmi_body_texture_lines_for_draw(draw: dict[str, object]) -> list[str]:
+    if "body" not in str(draw.get("object_name", "")).lower():
+        return []
+    return [
+        "ps-t5 = ResourceT5",
+        "ps-t7 = ResourceT7",
+        "ps-t8 = ResourceT8",
+        "ps-t18 = ResourceT18",
+    ]
 
+
+def _append_ntmi_draw_lines(lines: list[str], part: dict[str, object]):
+    for draw in part["draws"]:
+        lines.extend(_ntmi_body_texture_lines_for_draw(draw))
+        lines.append(f"; [mesh:{draw['object_name']}] [vertex_count:{draw['vertex_count']}]")
+        draw_line = f"drawindexed = {draw['index_count']},{draw['first_index']},0"
+        toggle = _draw_toggle_for_draw(draw)
+        if toggle is None:
+            lines.append(draw_line)
+        else:
+            variable_name, _ = toggle
+            lines.append(f"if ${variable_name} == 1")
+            lines.append(f"  {draw_line}")
+            lines.append("endif")
+
+
+def _append_ntmi_draw_overrides(lines: list[str], region_packages: list[dict[str, object]]):
     lines.append("; MARK: Draw replacement")
     for package in region_packages:
-        region_hash = str(package["region_hash"])
+        texcoord_hash = _ntmi_region_match_hash(package, "match_vs_texcoord_hash", _NTMI_DEFAULT_MATCH_TEXCOORD_HASH)
+        position_hash = _ntmi_region_match_hash(package, "match_vs_position_hash", _NTMI_DEFAULT_MATCH_POSITION_HASH)
+        outline_hash = _ntmi_region_match_hash(package, "match_vs_outline_hash", _NTMI_DEFAULT_MATCH_OUTLINE_HASH)
         source_ib_hash = str(package["source_ib_hash"])
         lines.extend(
             [
@@ -2332,128 +1629,56 @@ def _write_yihuan_main_ini(
         lines.extend(
             [
                 f"match_index_count = {int(package['original_match_index_count'])}",
-                f"run = CommandList_YihuanStoreResourceSlots_{runtime_suffix}",
+                "handling = skip",
             ]
         )
-        depth_entries = [
-            (hash_value, stage_filters["depth"][hash_value])
-            for hash_value in _hash_tuple(package.get("depth_vs_hashes"))
-            if hash_value in stage_filters["depth"]
-        ]
-        gbuffer_entries = [
-            (hash_value, stage_filters["gbuffer"][hash_value])
-            for hash_value in _hash_tuple(package.get("gbuffer_vs_hashes"))
-            if hash_value in stage_filters["gbuffer"]
-        ]
-        if depth_entries:
-            for hash_value, filter_index in sorted(set(depth_entries), key=lambda item: item[1]):
-                lines.append(f"if vs == {filter_index}")
-                lines.append("  handling = skip")
-                for part in package["parts"]:
-                    _append_part_stage_draw(
-                        lines,
-                        part=part,
-                        stage="depth",
-                        use_runtime_skin=include_runtime_skin,
-                        filter_index=filter_index,
-                        vs_hash=hash_value,
-                        resource_suffix=runtime_suffix,
-                    )
-                lines.append("endif")
-        if gbuffer_entries:
-            for hash_value, filter_index in sorted(set(gbuffer_entries), key=lambda item: item[1]):
-                lines.append(f"if vs == {filter_index}")
-                lines.append("  handling = skip")
-                for part in package["parts"]:
-                    _append_part_stage_draw(
-                        lines,
-                        part=part,
-                        stage="gbuffer",
-                        use_runtime_skin=include_runtime_skin,
-                        filter_index=filter_index,
-                        vs_hash=hash_value,
-                        resource_suffix=runtime_suffix,
-                    )
-                lines.append("endif")
-        if not depth_entries and not gbuffer_entries:
-            raise ValueError(
-                f"{region_hash}: cannot generate draw override without explicit depth/gbuffer VS hash metadata."
+        for part in sorted(package["parts"], key=lambda item: int(item["part_index"])):
+            lines.extend(
+                [
+                    f"; [part:{part['part_name']}] [vertex_count:{part['vertex_count']}]",
+                    f"ib = {_ntmi_part_resource(part, 'IB')}",
+                    f"match = vb, dynamic, {_ntmi_part_resource(part, 'RuntimeSkinnedPositionVB')}",
+                    f"match = vs, dynamic_prev, {_ntmi_part_resource(part, 'RuntimePrevSkinnedPosition')}",
+                    f"match = vs, {texcoord_hash}, {_ntmi_part_resource(part, 'Texcoord')}",
+                    f"match = vs, {position_hash}, {_ntmi_part_resource(part, 'Position')}",
+                    f"match = vs, dynamic, {_ntmi_part_resource(part, 'RuntimeSkinnedNormal')}",
+                    f"match = vs, {outline_hash}, {_ntmi_part_resource(part, 'OutlineParam')}",
+                ]
             )
-        lines.extend(
-            [
-                "if vs == 1",
-                "  ; Unknown shadow/extra pass: hand it back to the game.",
-                "  draw = from_caller",
-                "endif",
-                f"run = CommandList_YihuanRestoreResourceSlots_{runtime_suffix}",
-            ]
-        )
+            _append_ntmi_draw_lines(lines, part)
         lines.append("")
 
-    ini_path.write_text("\n".join(lines), encoding="utf-8")
-    return ini_path
 
-
-def _write_yihuan_bonestore_ini(
+def _write_ntmi_main_ini(
     *,
     export_root: Path,
     ini_name: str,
     source_collection: bpy.types.Collection,
     region_packages: list[dict[str, object]],
+    include_runtime_skin: bool,
 ) -> Path:
     if not region_packages:
-        raise ValueError("Cannot generate BoneStore INI without region packages.")
-    for package in region_packages:
-        if not str(package.get("last_cs_cb0_hash", "")):
-            raise ValueError(
-                f"{package.get('region_hash', 'unknown')}: cannot generate BoneStore INI without last_cs_cb0_hash."
-            )
-
-    bonestore_path = export_root / ini_name
+        raise ValueError("Cannot generate INI without region packages.")
+    ini_path = export_root / ini_name
+    lines: list[str] = []
     all_parts = [part for package in region_packages for part in package["parts"]]
-    bonestore_namespace = _yihuan_bonestore_namespace(region_packages)
-    source_suffix = _yihuan_source_suffix(region_packages)
-    _write_yihuan_bonestore_tables(
-        export_root=export_root,
-        parts=all_parts,
-        source_collection=source_collection,
-    )
-    lines: list[str] = [
-        f"namespace = {bonestore_namespace}",
-        "",
-        "; MARK: Shader filters for the original skinning CS chain",
-    ]
-    for cs_hash, filter_index in _YIHUAN_CS_FILTER_INDICES.items():
-        lines.extend(
-            [
-                f"[ShaderOverride_Yihuan_{source_suffix}_CS_{cs_hash[:8]}]",
-                f"hash = {cs_hash}",
-                f"filter_index = {filter_index}",
-                "allow_duplicate_hash = overrule",
-                "checktextureoverride = cs-cb0",
-                "",
-            ]
+    runtime_suffix = _yihuan_source_suffix(region_packages)
+    _append_ntmi_texture_sections(lines, all_parts)
+    _append_ntmi_draw_toggle_sections(lines, all_parts, source_suffix=runtime_suffix)
+    _append_ntmi_resource_sections(lines, all_parts)
+    if include_runtime_skin:
+        _append_ntmi_collector(
+            lines,
+            source_suffix=runtime_suffix,
+            source_collection=source_collection,
+            region_packages=region_packages,
+            parts=all_parts,
         )
+        _append_ntmi_skin_commandlist(lines, source_suffix=runtime_suffix, parts=all_parts)
+    _append_ntmi_draw_overrides(lines, region_packages)
 
-    lines.append("; MARK: Runtime resources")
-    _append_yihuan_bonestore_resource_sections(
-        lines,
-        all_parts,
-        source_collection=source_collection,
-    )
-    lines.append("")
-
-    lines.extend(
-        [
-            "; MARK: Bone collection",
-            "; Main INI copies the current native cs-t0 directly into the selected pose slot.",
-            "; No standalone TextureOverride collect hook is emitted here, avoiding duplicate CS work.",
-            "",
-        ]
-    )
-
-    bonestore_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
-    return bonestore_path
+    ini_path.write_text("\n".join(lines), encoding="utf-8")
+    return ini_path
 
 
 def _export_region_package(
@@ -2558,9 +1783,6 @@ def export_collection_package(
     export_root = _ensure_directory(Path(export_dir).resolve())
     buffer_dir = _ensure_directory(export_root / "Buffer")
     source_ib_hash = _source_root_hash(collection)
-    hlsl_dir: Path | None = None
-    if generate_ini:
-        hlsl_dir = export_profile_hlsl_assets(YIHUAN_PROFILE.profile_id, export_root)
     region_collections = _resolve_region_collections(collection)
     region_packages = [
         _export_region_package(
@@ -2574,20 +1796,13 @@ def export_collection_package(
     ]
 
     ini_file: Path | None = None
-    bonestore_ini_file: Path | None = None
     if generate_ini:
-        ini_file = _write_yihuan_main_ini(
+        ini_file = _write_ntmi_main_ini(
             export_root=export_root,
             ini_name=f"{source_ib_hash}.ini",
             source_collection=collection,
             region_packages=region_packages,
             include_runtime_skin=True,
-        )
-        bonestore_ini_file = _write_yihuan_bonestore_ini(
-            export_root=export_root,
-            ini_name=f"{source_ib_hash}-BoneStore.ini",
-            source_collection=collection,
-            region_packages=region_packages,
         )
 
     total_vertices = sum(int(part["vertex_count"]) for package in region_packages for part in package["parts"])
@@ -2607,7 +1822,7 @@ def export_collection_package(
         "draw_count": total_draws,
         "part_count": total_parts,
         "buffer_dir": str(buffer_dir),
-        "hlsl_dir": "" if hlsl_dir is None else str(hlsl_dir),
+        "hlsl_dir": "",
         "ini_path": "" if ini_file is None else str(ini_file),
-        "runtime_ini_path": str(bonestore_ini_file) if bonestore_ini_file is not None else "",
+        "runtime_ini_path": "",
     }

@@ -9,13 +9,12 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
-from .io import read_index_slice_txt, read_u32_at_byte_offset, read_u32_buffer
+from .io import read_index_slice_txt, read_u32_buffer
 from .models import (
     DetectedModelBundle,
     DetectedSlice,
     DispatchBatch,
     ResolvedImportBundle,
-    SectionTransform,
     Vb0OriginStage,
     Vb0OriginTrace,
 )
@@ -44,7 +43,6 @@ _CS_OUTPUT_DUMP_SOURCE_RE = re.compile(
     re.IGNORECASE,
 )
 _RAW_HASH_RE = re.compile(r"^[0-9a-f]{8,16}$", re.IGNORECASE)
-_VB1_OFFSET_RE = re.compile(r"^byte offset:\s*(?P<byte_offset>\d+)\s*$", re.IGNORECASE)
 
 _PRIMARY_CS_HASH = "f33fea3cca2704e4"
 _LAST_CS_HASH = "1e2a9061eadfeb6c"
@@ -154,20 +152,17 @@ def _parse_hash_value(value: str) -> tuple[str | None, str | None]:
     normalized = _normalize_hash(value)
     if normalized is None:
         return None, None
+    # Newer NTMI/3DMigoto dumps append the resource GPU address after the hash:
+    #   ib=0456d530@000000032E1B44A0
+    # The address is useful for humans, but the importer must group by the stable
+    # resource hash only.
+    if "@" in normalized:
+        normalized = normalized.split("@", 1)[0]
 
     if normalized.endswith(")") and "(" in normalized:
         display_hash, raw_hash = normalized.split("(", 1)
         return _normalize_hash(display_hash), _normalize_hash(raw_hash[:-1])
     return normalized, None
-
-
-def _parse_vb1_byte_offset(vb1_layout_path: str) -> int:
-    with open(vb1_layout_path, "r", encoding="utf-8", errors="replace") as handle:
-        for raw_line in handle:
-            match = _VB1_OFFSET_RE.match(raw_line.strip())
-            if match:
-                return int(match.group("byte_offset"))
-    raise ValueError(f"Could not find 'byte offset' inside {vb1_layout_path}")
 
 
 def _artifact_output(resources: dict[str, dict[str, _DumpArtifact]], label: str, extension: str) -> str | None:
@@ -568,17 +563,14 @@ def _build_vb0_origin_trace(
     )
 
 
-def _read_section_selector(vb1_buf_path: str | None, vb1_layout_path: str | None) -> int | None:
-    if not vb1_buf_path or not vb1_layout_path:
-        return None
-    byte_offset = _parse_vb1_byte_offset(vb1_layout_path)
-    return int(read_u32_at_byte_offset(vb1_buf_path, byte_offset))
-
-
 def _build_model_bundle(scan_result: _FrameScanResult, raw_ib_hash: str) -> DetectedModelBundle:
     raw_matching_draws = [record for record in scan_result.draw_records if record.raw_ib_hash == raw_ib_hash]
     if not raw_matching_draws:
-        raise ValueError(f"Could not find any draw slices for IB hash {raw_ib_hash} in {scan_result.frame_dump_dir}")
+        available = ", ".join(scan_result.raw_ib_hashes) or "<none>"
+        raise ValueError(
+            f"Could not find any draw slices for IB hash {raw_ib_hash} in {scan_result.frame_dump_dir}. "
+            f"Available IB hashes: {available}"
+        )
 
     main_draw = max(
         raw_matching_draws,
@@ -648,7 +640,6 @@ def _build_model_bundle(scan_result: _FrameScanResult, raw_ib_hash: str) -> Dete
                 producer_batch = batch
 
         selected_draw = draw_group[-1]
-        section_selector = _read_section_selector(selected_draw.vb1_buf_path, selected_draw.vb1_layout_path)
         depth_vs_hashes = tuple(
             sorted({str(record.vs_hash) for record in draw_group if record.vs_hash and _draw_stage(record) == "depth"})
         )
@@ -668,7 +659,6 @@ def _build_model_bundle(scan_result: _FrameScanResult, raw_ib_hash: str) -> Dete
                 producer_start_vertex=None if producer_batch is None else int(producer_batch.start_vertex),
                 producer_vertex_count=None if producer_batch is None else int(producer_batch.vertex_count),
                 vb1_layout_path=selected_draw.vb1_layout_path,
-                section_selector=section_selector,
                 producer_dispatch_index=None if producer_batch is None else int(producer_batch.dispatch_index),
                 producer_cs_hash=None if producer_batch is None else producer_batch.cs_hash,
                 producer_t0_hash=None if producer_batch is None else producer_batch.t0_hash,
@@ -677,7 +667,6 @@ def _build_model_bundle(scan_result: _FrameScanResult, raw_ib_hash: str) -> Dete
                 last_consumer_draw_index=int(draw_group[-1].event_index),
                 depth_vs_hashes=depth_vs_hashes,
                 gbuffer_vs_hashes=gbuffer_vs_hashes,
-                section_transform=None,
             )
         )
 
@@ -721,7 +710,11 @@ def discover_yihuan_model(frame_dump_dir: str | None = None, ib_hash: str | None
             raise ValueError("IB hash is empty.")
         raw_ib_hash = scan_result.display_to_raw_ib.get(requested_hash, requested_hash)
         if raw_ib_hash not in scan_result.raw_ib_hashes:
-            raise ValueError(f"Could not find IB hash {requested_hash} in {scan_result.frame_dump_dir}")
+            available = ", ".join(scan_result.raw_ib_hashes) or "<none>"
+            raise ValueError(
+                f"Could not find IB hash {requested_hash} in {scan_result.frame_dump_dir}. "
+                f"Available IB hashes: {available}"
+            )
         return _build_model_bundle(scan_result, raw_ib_hash)
 
     if not scan_result.raw_ib_hashes:

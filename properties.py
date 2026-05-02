@@ -15,10 +15,9 @@ REGISTERED_PROPERTY_PATHS = (
     (bpy.types.Scene, "modimp_collection_name"),
     (bpy.types.Scene, "modimp_use_pre_cs_source"),
     (bpy.types.Scene, "modimp_flip_v"),
+    (bpy.types.Scene, "modimp_mirror_flip"),
     (bpy.types.Scene, "modimp_shade_smooth"),
     (bpy.types.Scene, "modimp_store_orig_vertex_id"),
-    (bpy.types.Scene, "modimp_create_section_vertex_groups"),
-    (bpy.types.Scene, "modimp_apply_section_transform"),
     (bpy.types.Scene, "modimp_detected_model_name"),
     (bpy.types.Scene, "modimp_detected_slice_count"),
     (bpy.types.Scene, "modimp_resolved_ib_hash"),
@@ -81,27 +80,21 @@ def register_addon_properties():
         default=True,
         description="Flip the active UV V coordinate during import",
     )
+    bpy.types.Scene.modimp_mirror_flip = bpy.props.BoolProperty(
+        name="Mirror Flip",
+        default=True,
+        description="Mirror imported positions and tangent frames on Blender X so the imported model matches the in-game left/right orientation",
+    )
     bpy.types.Scene.modimp_shade_smooth = bpy.props.BoolProperty(
         name="Shade Smooth",
         default=True,
-        description="Mark imported polygons as smooth shaded",
+        description="Mark imported polygons as smooth shaded so imported custom normals are visible and exported as seen",
     )
     bpy.types.Scene.modimp_store_orig_vertex_id = bpy.props.BoolProperty(
         name="Store Original Vertex Id",
         default=True,
         description="Store the original global vertex id as the orig_vertex_id point attribute",
     )
-    bpy.types.Scene.modimp_create_section_vertex_groups = bpy.props.BoolProperty(
-        name="Create Section Groups",
-        default=False,
-        description="Create section_xxx vertex groups from the detected rigid section selector",
-    )
-    bpy.types.Scene.modimp_apply_section_transform = bpy.props.BoolProperty(
-        name="Apply Section Transform",
-        default=False,
-        description="Apply the currently decoded rigid section transform to imported objects",
-    )
-
     bpy.types.Scene.modimp_detected_model_name = bpy.props.StringProperty(
         name="Detected Model",
         default="",

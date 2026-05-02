@@ -57,19 +57,6 @@ class DispatchBatch:
 
 
 @dataclass(frozen=True)
-class SectionTransform:
-    """One rigid section transform decoded from the currently understood VS data."""
-
-    basis_x: tuple[float, float, float]
-    basis_y: tuple[float, float, float]
-    basis_z: tuple[float, float, float]
-    translation: tuple[float, float, float]
-    section_selector: int
-    section_record: int
-    source_label: str
-
-
-@dataclass(frozen=True)
 class Vb0OriginStage:
     """One observed stage in the b1c65387 compute chain."""
 
@@ -104,7 +91,6 @@ class DetectedSlice:
     producer_start_vertex: int | None
     producer_vertex_count: int | None
     vb1_layout_path: str | None
-    section_selector: int | None
     producer_dispatch_index: int | None
     producer_cs_hash: str | None
     producer_t0_hash: str | None
@@ -113,7 +99,6 @@ class DetectedSlice:
     last_consumer_draw_index: int | None
     depth_vs_hashes: tuple[str, ...]
     gbuffer_vs_hashes: tuple[str, ...]
-    section_transform: SectionTransform | None
 
 
 @dataclass(frozen=True)

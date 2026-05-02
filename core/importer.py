@@ -16,7 +16,7 @@ from .io import (
     read_vb0_positions,
     read_weight_pairs,
 )
-from .models import DetectedModelBundle, PackedHalf2x4, ResolvedImportBundle, SectionTransform
+from .models import DetectedModelBundle, PackedHalf2x4, ResolvedImportBundle
 
 
 @dataclass(frozen=True)
@@ -150,11 +150,6 @@ def _assign_palette_groups(
             vertex_group.add([vertex_index], bone_weight, "ADD")
 
 
-def _assign_section_vertex_group(imported_object: bpy.types.Object, section_selector: int):
-    vertex_group = imported_object.vertex_groups.new(name=f"section_{section_selector:03d}")
-    vertex_group.add(list(range(len(imported_object.data.vertices))), 1.0, "REPLACE")
-
-
 def _slice_object_name(*, object_prefix: str, ib_hash: str, detected_slice) -> str:
     hash_value = (detected_slice.display_ib_hash or ib_hash or "unknown").lower()
     base_name = f"{hash_value}-{int(detected_slice.index_count)}-{int(detected_slice.first_index)}"
@@ -162,28 +157,8 @@ def _slice_object_name(*, object_prefix: str, ib_hash: str, detected_slice) -> s
     return f"{prefix}_{base_name}" if prefix else base_name
 
 
-def _apply_section_transform(
-    imported_object: bpy.types.Object,
-    section_transform: SectionTransform,
-    *,
-    profile_id: str,
-):
-    from mathutils import Matrix
-
-    converter = get_game_data_converter(profile_id)
-    converted_transform = converter.to_blender_section_transform(section_transform)
-    basis_x = converted_transform.basis_x
-    basis_y = converted_transform.basis_y
-    basis_z = converted_transform.basis_z
-    translation = converted_transform.translation
-    imported_object.matrix_world = Matrix(
-        (
-            (basis_x[0], basis_y[0], basis_z[0], translation[0]),
-            (basis_x[1], basis_y[1], basis_z[1], translation[1]),
-            (basis_x[2], basis_y[2], basis_z[2], translation[2]),
-            (0.0, 0.0, 0.0, 1.0),
-        )
-    )
+def _mirror_x_vector(vector: tuple[float, float, float]) -> tuple[float, float, float]:
+    return (-float(vector[0]), float(vector[1]), float(vector[2]))
 
 
 def _load_import_resources(resolved_bundle: ResolvedImportBundle) -> _LoadedImportResources:
@@ -234,10 +209,9 @@ def _import_single_slice(
     object_name: str,
     collection_name: str,
     flip_uv_v: bool,
+    mirror_flip: bool,
     shade_smooth: bool,
     store_orig_vertex_id: bool,
-    create_section_vertex_group: bool,
-    apply_section_transform: bool,
     activate_object: bool,
 ) -> tuple[bpy.types.Object, dict[str, int]]:
     index_slice = read_index_slice_txt(resolved_bundle.selected_slice.ib_txt_path)
@@ -247,6 +221,8 @@ def _import_single_slice(
     packed_uv_entries = resource_cache.packed_uv_entries
     geometry = build_compacted_geometry(positions, index_slice.triangles, packed_uv_entries)
     blender_positions = [converter.to_blender_position(position) for position in geometry.positions]
+    if mirror_flip:
+        blender_positions = [_mirror_x_vector(position) for position in blender_positions]
 
     compact_blend_indices = None
     compact_blend_weights = None
@@ -276,6 +252,10 @@ def _import_single_slice(
         decoded_tangents = [frame.tangent for frame in decoded_frames]
         decoded_normals = [frame.normal for frame in decoded_frames]
         decoded_bitangent_signs = [frame.bitangent_sign for frame in decoded_frames]
+        if mirror_flip:
+            decoded_tangents = [_mirror_x_vector(tangent) for tangent in decoded_tangents]
+            decoded_normals = [_mirror_x_vector(normal) for normal in decoded_normals]
+            decoded_bitangent_signs = [-sign for sign in decoded_bitangent_signs]
         compact_normals = decoded_normals
     elif resolved_bundle.t7_buf_path:
         if resource_cache.post_frame_a is None or resource_cache.post_frame_b is None:
@@ -288,6 +268,10 @@ def _import_single_slice(
         decoded_tangents = [frame.tangent for frame in decoded_frames]
         decoded_normals = [frame.normal for frame in decoded_frames]
         decoded_bitangent_signs = [frame.bitangent_sign for frame in decoded_frames]
+        if mirror_flip:
+            decoded_tangents = [_mirror_x_vector(tangent) for tangent in decoded_tangents]
+            decoded_normals = [_mirror_x_vector(normal) for normal in decoded_normals]
+            decoded_bitangent_signs = [-sign for sign in decoded_bitangent_signs]
         compact_normals = decoded_normals
 
     target_collection = _ensure_collection(context.scene, collection_name)
@@ -295,6 +279,8 @@ def _import_single_slice(
     imported_object = bpy.data.objects.new(object_name, mesh)
     target_collection.objects.link(imported_object)
 
+    # Import is intentionally simple: positions and tangent frames are converted
+    # to Blender space, but triangle winding is kept exactly as captured.
     mesh.from_pydata(blender_positions, [], geometry.triangles)
     mesh.validate(verbose=False, clean_customdata=False)
     mesh.update()
@@ -326,20 +312,6 @@ def _import_single_slice(
 
     if store_orig_vertex_id:
         _store_original_vertex_ids(mesh, geometry.original_vertex_ids)
-    if resolved_bundle.selected_slice.section_selector is not None:
-        _store_int_attribute(
-            mesh,
-            "section_selector",
-            [int(resolved_bundle.selected_slice.section_selector)] * len(mesh.vertices),
-        )
-    if create_section_vertex_group and resolved_bundle.selected_slice.section_selector is not None:
-        _assign_section_vertex_group(imported_object, resolved_bundle.selected_slice.section_selector)
-    if apply_section_transform and resolved_bundle.selected_slice.section_transform is not None:
-        _apply_section_transform(
-            imported_object,
-            resolved_bundle.selected_slice.section_transform,
-            profile_id=resolved_bundle.profile_id,
-        )
 
     imported_object["modimp_profile_id"] = resolved_bundle.profile_id
     imported_object["modimp_ib_hash"] = resolved_bundle.ib_hash
@@ -381,13 +353,7 @@ def _import_single_slice(
         imported_object["modimp_last_cs_cb0_hash"] = resolved_bundle.last_cs_cb0_hash
     if resolved_bundle.selected_slice.vb1_layout_path is not None:
         imported_object["modimp_vb1_layout_path"] = resolved_bundle.selected_slice.vb1_layout_path
-    if resolved_bundle.selected_slice.section_selector is not None:
-        imported_object["modimp_section_selector"] = int(resolved_bundle.selected_slice.section_selector)
-    if resolved_bundle.selected_slice.section_transform is not None:
-        imported_object["modimp_transform_source"] = resolved_bundle.selected_slice.section_transform.source_label
-        imported_object["modimp_transform_applied"] = bool(apply_section_transform)
-    else:
-        imported_object["modimp_transform_applied"] = False
+    imported_object["modimp_mirror_flip"] = bool(mirror_flip)
     imported_object["modimp_root_vb0_path"] = resolved_bundle.vb0_origin_trace.closest_rest_pose_path
     imported_object["modimp_root_vb0_note"] = resolved_bundle.vb0_origin_trace.note
 
@@ -407,10 +373,9 @@ def import_detected_model(
     object_prefix: str,
     collection_name: str,
     flip_uv_v: bool,
+    mirror_flip: bool,
     shade_smooth: bool,
     store_orig_vertex_id: bool,
-    create_section_vertex_group: bool,
-    apply_section_transform: bool,
     use_pre_cs_source: bool,
 ) -> tuple[list[bpy.types.Object], dict[str, int]]:
     """Import every detected slice for the profile model."""
@@ -483,10 +448,9 @@ def import_detected_model(
             object_name=slice_name,
             collection_name=collection_name,
             flip_uv_v=flip_uv_v,
+            mirror_flip=mirror_flip,
             shade_smooth=shade_smooth,
             store_orig_vertex_id=store_orig_vertex_id,
-            create_section_vertex_group=create_section_vertex_group,
-            apply_section_transform=apply_section_transform,
             activate_object=False,
         )
         imported_objects.append(imported_object)
@@ -511,10 +475,9 @@ def import_resolved_slice(
     object_name: str,
     collection_name: str,
     flip_uv_v: bool,
+    mirror_flip: bool,
     shade_smooth: bool,
     store_orig_vertex_id: bool,
-    create_section_vertex_group: bool,
-    apply_section_transform: bool,
 ) -> tuple[bpy.types.Object, dict[str, int]]:
     """Import one resolved slice bundle."""
     default_object_name = _slice_object_name(
@@ -529,9 +492,8 @@ def import_resolved_slice(
         object_name=object_name or default_object_name,
         collection_name=collection_name,
         flip_uv_v=flip_uv_v,
+        mirror_flip=mirror_flip,
         shade_smooth=shade_smooth,
         store_orig_vertex_id=store_orig_vertex_id,
-        create_section_vertex_group=create_section_vertex_group,
-        apply_section_transform=apply_section_transform,
         activate_object=True,
     )
