@@ -15,6 +15,7 @@ from .models import (
     DetectedSlice,
     DispatchBatch,
     ResolvedImportBundle,
+    TextureBinding,
     Vb0OriginStage,
     Vb0OriginTrace,
 )
@@ -29,9 +30,11 @@ _DISPATCH_RE = re.compile(
     r"^(?P<event>\d{6}) Dispatch\(ThreadGroupCountX:(?P<x>\d+), "
     r"ThreadGroupCountY:(?P<y>\d+), ThreadGroupCountZ:(?P<z>\d+)\)"
 )
-_DUMP_RE = re.compile(r"^(?P<event>\d{6}) 3DMigoto Dumping Buffer (?P<source>.+?) -> (?P<dest>.+)$")
+_DUMP_RE = re.compile(
+    r"^(?P<event>\d{6}) 3DMigoto Dumping (?:Buffer|Texture\w*) (?P<source>.+?) -> (?P<dest>.+)$"
+)
 _DRAW_DUMP_SOURCE_RE = re.compile(
-    r"^(?P<event>\d{6})-(?P<label>[^=]+)=(?P<value>.+)-vs=(?P<vs>[0-9a-f]{16})-ps=(?P<ps>[0-9a-f]{16})\.(?P<ext>buf|txt)$",
+    r"^(?P<event>\d{6})-(?P<label>[^=]+)=(?P<value>.+)-vs=(?P<vs>[0-9a-f]{16})(?:-gs=[0-9a-f]{16})?-ps=(?P<ps>[0-9a-f]{16})\.(?P<ext>buf|txt|dds|jpg|png)$",
     re.IGNORECASE,
 )
 _CS_INPUT_DUMP_SOURCE_RE = re.compile(
@@ -44,16 +47,13 @@ _CS_OUTPUT_DUMP_SOURCE_RE = re.compile(
 )
 _RAW_HASH_RE = re.compile(r"^[0-9a-f]{8,16}$", re.IGNORECASE)
 
-_PRIMARY_CS_HASH = "f33fea3cca2704e4"
-_LAST_CS_HASH = "1e2a9061eadfeb6c"
-
-
 @dataclass(frozen=True)
 class _DumpArtifact:
     event_index: int
     label: str
     hash_value: str | None
     raw_hash: str | None
+    resource_identity: str | None
     input_path: str
     output_path: str
     extension: str
@@ -92,6 +92,7 @@ class _ResolvedDrawRecord:
     ib_txt_path: str
     ib_buf_path: str | None
     vb0_hash: str | None
+    vb0_identity: str | None
     vb0_buf_path: str | None
     vb1_hash: str | None
     vb1_buf_path: str | None
@@ -107,6 +108,10 @@ class _ResolvedDrawRecord:
     vs_hash: str | None
     ps_hash: str | None
     vs_resource_labels: tuple[str, ...]
+    vs_resource_hashes: dict[str, str]
+    ps_resource_hashes: dict[str, str]
+    ps_resource_paths: dict[str, str]
+    rt_count: int
 
 
 @dataclass(frozen=True)
@@ -133,6 +138,50 @@ def _u32_to_float(value: int) -> float:
     return struct.unpack("<f", struct.pack("<I", int(value) & 0xFFFFFFFF))[0]
 
 
+def _float3_vertex_count(path: str | None) -> int | None:
+    if not path:
+        return None
+    try:
+        size = Path(path).stat().st_size
+    except OSError:
+        return None
+    if size <= 0 or size % 12 != 0:
+        return None
+    return size // 12
+
+
+def _infer_dispatch_vertex_range(
+    cb0_values: list[int] | tuple[int, ...],
+    *,
+    output_vertex_count: int | None,
+) -> tuple[int, int]:
+    """Infer the written vertex range from observed cb0 layouts.
+
+    Different game CS variants encode start/count in different cb0 lanes. The
+    importer should follow the dumped resources, not a fixed shader hash, so we
+    score the known lane pairs and keep the one that fits the output buffer.
+    This is analysis-only. Runtime collector keys and finish conditions are
+    inferred later from the same observed cb0 values instead of hard-coded lanes.
+    """
+    if len(cb0_values) < 4:
+        return 0, int(output_vertex_count or 0)
+
+    primary_candidate = (int(cb0_values[1]), int(cb0_values[2]))
+    chained_candidate = (int(cb0_values[2]), int(cb0_values[3]))
+    if int(cb0_values[1]) == int(cb0_values[2]) and int(cb0_values[3]) > 0:
+        candidates = [chained_candidate, primary_candidate]
+    else:
+        candidates = [primary_candidate, chained_candidate]
+
+    for start_vertex, vertex_count in candidates:
+        if start_vertex < 0 or vertex_count <= 0:
+            continue
+        if output_vertex_count is not None and start_vertex + vertex_count > output_vertex_count:
+            continue
+        return start_vertex, vertex_count
+    return 0, int(output_vertex_count or 0)
+
+
 def _ensure_frame_dump_dir(frame_dump_dir: str | None) -> Path:
     requested_dir = (frame_dump_dir or YIHUAN_PROFILE.default_frame_dump_dir or "").strip()
     if not requested_dir:
@@ -148,21 +197,18 @@ def _ensure_frame_dump_dir(frame_dump_dir: str | None) -> Path:
     return resolved_dir
 
 
-def _parse_hash_value(value: str) -> tuple[str | None, str | None]:
+def _parse_hash_value(value: str) -> tuple[str | None, str | None, str | None]:
     normalized = _normalize_hash(value)
     if normalized is None:
-        return None, None
-    # Newer NTMI/3DMigoto dumps append the resource GPU address after the hash:
-    #   ib=0456d530@000000032E1B44A0
-    # The address is useful for humans, but the importer must group by the stable
-    # resource hash only.
-    if "@" in normalized:
-        normalized = normalized.split("@", 1)[0]
+        return None, None, None
 
-    if normalized.endswith(")") and "(" in normalized:
-        display_hash, raw_hash = normalized.split("(", 1)
-        return _normalize_hash(display_hash), _normalize_hash(raw_hash[:-1])
-    return normalized, None
+    resource_identity = normalized
+    stable_value = normalized.split("@", 1)[0] if "@" in normalized else normalized
+
+    if stable_value.endswith(")") and "(" in stable_value:
+        display_hash, raw_hash = stable_value.split("(", 1)
+        return _normalize_hash(display_hash), _normalize_hash(raw_hash[:-1]), resource_identity
+    return stable_value, None, resource_identity
 
 
 def _artifact_output(resources: dict[str, dict[str, _DumpArtifact]], label: str, extension: str) -> str | None:
@@ -170,9 +216,22 @@ def _artifact_output(resources: dict[str, dict[str, _DumpArtifact]], label: str,
     return None if artifact is None else artifact.output_path
 
 
+def _artifact_first_output(
+    resources: dict[str, dict[str, _DumpArtifact]],
+    label: str,
+    extensions: tuple[str, ...],
+) -> tuple[str, str] | None:
+    artifact_group = resources.get(label, {})
+    for extension in extensions:
+        artifact = artifact_group.get(extension)
+        if artifact is not None:
+            return artifact.output_path, extension
+    return None
+
+
 def _artifact_hash(resources: dict[str, dict[str, _DumpArtifact]], label: str) -> str | None:
     artifact_group = resources.get(label, {})
-    for extension in ("buf", "txt"):
+    for extension in ("buf", "txt", "dds", "jpg", "png"):
         artifact = artifact_group.get(extension)
         if artifact is None:
             continue
@@ -180,14 +239,33 @@ def _artifact_hash(resources: dict[str, dict[str, _DumpArtifact]], label: str) -
     return None
 
 
+def _artifact_identity(resources: dict[str, dict[str, _DumpArtifact]], label: str) -> str | None:
+    artifact_group = resources.get(label, {})
+    for extension in ("buf", "txt", "dds", "jpg", "png"):
+        artifact = artifact_group.get(extension)
+        if artifact is None:
+            continue
+        return artifact.resource_identity or artifact.raw_hash or artifact.hash_value
+    return None
+
+
 def _artifact_display_hash(resources: dict[str, dict[str, _DumpArtifact]], label: str) -> str | None:
     artifact_group = resources.get(label, {})
-    for extension in ("buf", "txt"):
+    for extension in ("buf", "txt", "dds", "jpg", "png"):
         artifact = artifact_group.get(extension)
         if artifact is None:
             continue
         return artifact.hash_value
     return None
+
+
+def _draw_rt_count(resources: dict[str, dict[str, _DumpArtifact]]) -> int:
+    return sum(
+        1
+        for label, artifact_group in resources.items()
+        if re.fullmatch(r"o\d+", label)
+        and any(extension in {"dds", "jpg", "png"} for extension in artifact_group)
+    )
 
 
 def _parse_dump_artifact(input_path: str, output_path: str) -> _DumpArtifact | None:
@@ -200,12 +278,13 @@ def _parse_dump_artifact(input_path: str, output_path: str) -> _DumpArtifact | N
         groups = match.groupdict()
         event_index = int(groups["event"])
         label = groups["label"]
-        hash_value, raw_hash = _parse_hash_value(groups["value"])
+        hash_value, raw_hash, resource_identity = _parse_hash_value(groups["value"])
         return _DumpArtifact(
             event_index=event_index,
             label=label,
             hash_value=hash_value,
             raw_hash=raw_hash,
+            resource_identity=resource_identity,
             input_path=input_path,
             output_path=output_path,
             extension=groups["ext"].lower(),
@@ -247,6 +326,28 @@ def _build_draw_records(draw_events: dict[int, _DrawEventRecord]) -> tuple[_Reso
         vs_hash = next((artifact.vs_hash for artifact in artifacts if artifact.vs_hash), None)
         ps_hash = next((artifact.ps_hash for artifact in artifacts if artifact.ps_hash), None)
         vs_resource_labels = tuple(sorted(event.resources.keys()))
+        vs_resource_hashes = {
+            label: hash_value
+            for label in sorted(event.resources.keys())
+            if label.startswith("vs-t")
+            for hash_value in [_artifact_hash(event.resources, label)]
+            if hash_value
+        }
+        ps_resource_hashes = {
+            label: hash_value
+            for label in sorted(event.resources.keys())
+            if label.startswith("ps-t")
+            for hash_value in [_artifact_hash(event.resources, label)]
+            if hash_value
+        }
+        ps_resource_paths = {
+            label: output_path
+            for label in sorted(event.resources.keys())
+            if label.startswith("ps-t")
+            for output in [_artifact_first_output(event.resources, label, ("dds", "jpg", "png"))]
+            if output is not None
+            for output_path, _extension in [output]
+        }
 
         draw_records.append(
             _ResolvedDrawRecord(
@@ -259,6 +360,7 @@ def _build_draw_records(draw_events: dict[int, _DrawEventRecord]) -> tuple[_Reso
                 ib_txt_path=ib_txt_path,
                 ib_buf_path=_artifact_output(event.resources, "ib", "buf"),
                 vb0_hash=_artifact_hash(event.resources, "vb0"),
+                vb0_identity=_artifact_identity(event.resources, "vb0"),
                 vb0_buf_path=_artifact_output(event.resources, "vb0", "buf"),
                 vb1_hash=_artifact_hash(event.resources, "vb1"),
                 vb1_buf_path=_artifact_output(event.resources, "vb1", "buf"),
@@ -276,22 +378,17 @@ def _build_draw_records(draw_events: dict[int, _DrawEventRecord]) -> tuple[_Reso
                 vs_hash=vs_hash,
                 ps_hash=ps_hash,
                 vs_resource_labels=vs_resource_labels,
+                vs_resource_hashes=vs_resource_hashes,
+                ps_resource_hashes=ps_resource_hashes,
+                ps_resource_paths=ps_resource_paths,
+                rt_count=_draw_rt_count(event.resources),
             )
         )
     return tuple(draw_records)
 
 
-def _draw_stage(record: _ResolvedDrawRecord) -> str:
-    labels = set(record.vs_resource_labels)
-    if "vs-t6" in labels or "vs-t7" in labels:
-        return "gbuffer"
-    if "vs-t3" in labels or "vs-t4" in labels or "vs-t5" in labels:
-        return "depth"
-    return ""
-
-
 def analyze_yihuan_frame_stages(frame_dump_dir: str | None, ib_hash: str | None = None) -> dict[str, object]:
-    """Return a compact, UI-friendly FrameAnalysis stage report for the Yihuan profile."""
+    """Return a compact, UI-friendly FrameAnalysis resource report for the Yihuan profile."""
     scan_result = _scan_yihuan_frame_dump(frame_dump_dir)
     requested_hash = _normalize_hash(ib_hash)
     if requested_hash:
@@ -303,25 +400,11 @@ def analyze_yihuan_frame_stages(frame_dump_dir: str | None, ib_hash: str | None 
             record for record in scan_result.draw_records if record.raw_ib_hash == raw_ib_hash
         ])
 
-    stage_bases = {
-        "depth": 4100,
-        "gbuffer": 4200,
-        "unknown": 4900,
-    }
-    stage_next = dict(stage_bases)
-    shader_to_filter: dict[tuple[str, str], int] = {}
     draw_rows: list[dict[str, object]] = []
     for record in sorted(draw_records, key=lambda item: item.event_index):
-        stage = _draw_stage(record) or "unknown"
-        shader_key = (stage, record.vs_hash or "")
-        if shader_key not in shader_to_filter:
-            shader_to_filter[shader_key] = stage_next[stage]
-            stage_next[stage] += 1
         draw_rows.append(
             {
                 "event_index": record.event_index,
-                "stage": stage,
-                "filter_index": shader_to_filter[shader_key],
                 "raw_ib_hash": record.raw_ib_hash,
                 "display_ib_hash": record.display_ib_hash or "",
                 "first_index": record.first_index,
@@ -329,8 +412,13 @@ def analyze_yihuan_frame_stages(frame_dump_dir: str | None, ib_hash: str | None 
                 "base_vertex": record.base_vertex,
                 "vs_hash": record.vs_hash or "",
                 "ps_hash": record.ps_hash or "",
+                "rt_count": record.rt_count,
                 "vb0_hash": record.vb0_hash or "",
+                "vb0_identity": record.vb0_identity or "",
                 "resource_labels": list(record.vs_resource_labels),
+                "resource_hashes": dict(record.vs_resource_hashes),
+                "ps_resource_hashes": dict(record.ps_resource_hashes),
+                "ps_resource_paths": dict(record.ps_resource_paths),
             }
         )
 
@@ -338,26 +426,25 @@ def analyze_yihuan_frame_stages(frame_dump_dir: str | None, ib_hash: str | None 
     for event_index, record in sorted(scan_result.dispatch_records.items()):
         cb0_hash = _artifact_hash(record.resources, "cb0") or ""
         cb0_buf_path = _artifact_output(record.resources, "cb0", "buf") or ""
-        start_vertex = 0
-        vertex_count = 0
-        if record.cs_hash in {_PRIMARY_CS_HASH, _LAST_CS_HASH} and cb0_buf_path:
-            cb0_values = read_u32_buffer(str(cb0_buf_path))
-            if len(cb0_values) >= 4:
-                if record.cs_hash == _PRIMARY_CS_HASH:
-                    start_vertex = int(cb0_values[1])
-                    vertex_count = int(cb0_values[2])
-                else:
-                    start_vertex = int(cb0_values[2])
-                    vertex_count = int(cb0_values[3])
+        output_path = _artifact_output(record.resources, "u1", "buf") or _artifact_output(record.resources, "u0", "buf")
+        output_vertex_count = _float3_vertex_count(output_path)
+        start_vertex, vertex_count = _infer_dispatch_vertex_range(
+            read_u32_buffer(str(cb0_buf_path)) if cb0_buf_path else [],
+            output_vertex_count=output_vertex_count,
+        )
         dispatch_rows.append(
             {
                 "event_index": event_index,
-                "filter_index": 3300 if record.cs_hash == _PRIMARY_CS_HASH else 3301 if record.cs_hash == _LAST_CS_HASH else 3399,
                 "cs_hash": record.cs_hash or "",
                 "cb0_hash": cb0_hash,
                 "t0_hash": _artifact_hash(record.resources, "t0") or "",
+                "u0_hash": _artifact_hash(record.resources, "u0") or "",
+                "u1_hash": _artifact_hash(record.resources, "u1") or "",
+                "u0_identity": _artifact_identity(record.resources, "u0") or "",
+                "u1_identity": _artifact_identity(record.resources, "u1") or "",
                 "cb0_buf_path": cb0_buf_path,
                 "t0_buf_path": _artifact_output(record.resources, "t0", "buf") or "",
+                "u0_buf_path": _artifact_output(record.resources, "u0", "buf") or "",
                 "u1_buf_path": _artifact_output(record.resources, "u1", "buf") or "",
                 "start_vertex": start_vertex,
                 "vertex_count": vertex_count,
@@ -370,22 +457,12 @@ def analyze_yihuan_frame_stages(frame_dump_dir: str | None, ib_hash: str | None 
             }
         )
 
-    stage_candidates: dict[str, list[dict[str, object]]] = {}
-    for row in draw_rows:
-        stage_candidates.setdefault(str(row["stage"]), []).append(row)
-    stage_map = {
-        f"{stage}:{vs_hash}": filter_index
-        for (stage, vs_hash), filter_index in sorted(shader_to_filter.items(), key=lambda item: item[1])
-    }
-
     return {
         "profile_id": YIHUAN_PROFILE.profile_id,
         "frame_dump_dir": scan_result.frame_dump_dir,
         "raw_ib_hash": raw_ib_hash,
         "draw_count": len(draw_rows),
         "dispatch_count": len(dispatch_rows),
-        "stage_candidates": stage_candidates,
-        "stage_map": stage_map,
         "draw_pass_map": draw_rows,
         "cs_collect_map": dispatch_rows,
         "draws": draw_rows,
@@ -459,15 +536,20 @@ def _build_dispatch_batches(
     dispatch_records: dict[int, _DispatchEventRecord],
     *,
     target_u1_hash: str,
+    target_u1_identity: str | None = None,
 ) -> list[DispatchBatch]:
     batches: list[DispatchBatch] = []
+    normalized_target_hash = _normalize_hash(target_u1_hash)
+    normalized_target_identity = _normalize_hash(target_u1_identity)
+    use_identity = bool(normalized_target_identity and "@" in normalized_target_identity)
     for dispatch_index, record in sorted(dispatch_records.items()):
         cs_hash = _normalize_hash(record.cs_hash)
-        if cs_hash not in {_PRIMARY_CS_HASH, _LAST_CS_HASH}:
-            continue
-
         u1_hash = _artifact_hash(record.resources, "u1")
-        if _normalize_hash(u1_hash) != _normalize_hash(target_u1_hash):
+        u1_identity = _artifact_identity(record.resources, "u1")
+        if use_identity:
+            if _normalize_hash(u1_identity) != normalized_target_identity:
+                continue
+        elif _normalize_hash(u1_hash) != normalized_target_hash:
             continue
 
         cb0_buf_path = _artifact_output(record.resources, "cb0", "buf")
@@ -479,17 +561,15 @@ def _build_dispatch_batches(
         if len(cb0_values) < 8:
             raise ValueError(f"Expected at least 8 uint32 values in cb0 buffer: {cb0_buf_path}")
 
-        if cs_hash == _PRIMARY_CS_HASH:
-            start_vertex = int(cb0_values[1])
-            vertex_count = int(cb0_values[2])
-        else:
-            start_vertex = int(cb0_values[2])
-            vertex_count = int(cb0_values[3])
+        start_vertex, vertex_count = _infer_dispatch_vertex_range(
+            cb0_values,
+            output_vertex_count=_float3_vertex_count(_artifact_output(record.resources, "u1", "buf")),
+        )
 
         batches.append(
             DispatchBatch(
                 dispatch_index=dispatch_index,
-                cs_hash=cs_hash,
+                cs_hash=cs_hash or "",
                 cb0_hash=_normalize_hash(cb0_hash) or "",
                 cb0_buf_path=str(cb0_buf_path),
                 t0_hash=_artifact_hash(record.resources, "t0"),
@@ -498,6 +578,8 @@ def _build_dispatch_batches(
                 vertex_count=vertex_count,
                 u0_hash=_artifact_hash(record.resources, "u0"),
                 u1_hash=u1_hash,
+                u0_identity=_artifact_identity(record.resources, "u0"),
+                u1_identity=u1_identity,
             )
         )
 
@@ -505,11 +587,15 @@ def _build_dispatch_batches(
 
 
 def _resolve_input_slots_for_dispatch(record: _DispatchEventRecord, cs_hash: str) -> tuple[str, str, str]:
-    if cs_hash == _PRIMARY_CS_HASH:
-        return "t3", "t1", "t2"
-    if cs_hash == _LAST_CS_HASH:
+    del cs_hash
+    labels = set(record.resources.keys())
+    if {"t4", "t2", "t3"}.issubset(labels):
         return "t4", "t2", "t3"
-    raise ValueError(f"Unsupported producer CS hash: {cs_hash}")
+    if {"t3", "t1", "t2"}.issubset(labels):
+        return "t3", "t1", "t2"
+    raise ValueError(
+        f"Could not infer producer CS input slots from dumped resources: {', '.join(sorted(labels))}"
+    )
 
 
 def _most_common_path(paths: list[str | None]) -> str:
@@ -525,6 +611,92 @@ def _most_common_hash(values: list[str | None]) -> str | None:
     if not valid_values:
         return None
     return Counter(valid_values).most_common(1)[0][0]
+
+
+def _infer_reused_vs_resource_hash(
+    draw_group: list[_ResolvedDrawRecord],
+    *,
+    labels: tuple[str, ...],
+) -> str | None:
+    grouped: dict[str, dict[str, object]] = {}
+    for record in draw_group:
+        for label in labels:
+            hash_value = _normalize_hash(record.vs_resource_hashes.get(label))
+            if not hash_value:
+                continue
+            item = grouped.setdefault(hash_value, {"labels": set(), "count": 0})
+            item["labels"].add(label)
+            item["count"] = int(item["count"]) + 1
+    if not grouped:
+        return None
+    return max(
+        grouped.items(),
+        key=lambda item: (
+            len(item[1]["labels"]),
+            int(item[1]["count"]),
+            item[0],
+        ),
+    )[0]
+
+
+def _infer_static_match_hashes(
+    draw_group: list[_ResolvedDrawRecord],
+    *,
+    texcoord_hash_hint: str | None = None,
+    position_hash_hint: str | None = None,
+) -> dict[str, str | None]:
+    # The old heuristic guessed "static position" from common VS slots. Transparent
+    # passes can bind skinned position in vs-t4, which made us replace a dynamic
+    # position stream with the bind-pose Position buffer. Prefer producer/draw
+    # facts when we have them, then fall back to the broad heuristic.
+    position_hash = _normalize_hash(position_hash_hint) or _infer_reused_vs_resource_hash(
+        draw_group,
+        labels=("vs-t4", "vs-t6"),
+    )
+    outline_hash = _infer_reused_vs_resource_hash(draw_group, labels=("vs-t6", "vs-t8"))
+    if outline_hash == position_hash:
+        outline_hash = None
+    return {
+        "texcoord": _normalize_hash(texcoord_hash_hint)
+        or _infer_reused_vs_resource_hash(draw_group, labels=("vs-t3", "vs-t5")),
+        "position": position_hash,
+        "outline": outline_hash,
+    }
+
+
+def _infer_texture_slots(draw_group: list[_ResolvedDrawRecord]) -> dict[str, TextureBinding]:
+    desired_slots = ("ps-t5", "ps-t7", "ps-t8", "ps-t18")
+    candidate = max(
+        draw_group,
+        key=lambda record: (
+            sum(1 for slot in desired_slots if slot in record.ps_resource_paths),
+            int(record.index_count),
+            int(record.event_index),
+        ),
+    )
+    texture_slots: dict[str, TextureBinding] = {}
+    for slot in desired_slots:
+        source_path = candidate.ps_resource_paths.get(slot)
+        hash_value = _normalize_hash(candidate.ps_resource_hashes.get(slot))
+        if not source_path or not hash_value:
+            continue
+        extension = Path(source_path).suffix.lower().lstrip(".") or "dds"
+        texture_slots[slot] = TextureBinding(
+            slot=slot,
+            hash_value=hash_value,
+            source_path=str(source_path),
+            extension=extension,
+            draw_index=int(candidate.event_index),
+            ps_hash=candidate.ps_hash,
+            rt_count=int(candidate.rt_count),
+        )
+    return texture_slots
+
+
+def _g_buffer_draw_score(record: _ResolvedDrawRecord) -> tuple[int, int, int, int]:
+    desired_slots = ("ps-t5", "ps-t7", "ps-t8", "ps-t18")
+    texture_score = sum(1 for slot in desired_slots if slot in record.ps_resource_hashes)
+    return texture_score, int(record.rt_count), int(record.index_count), int(record.event_index)
 
 
 def _build_vb0_origin_trace(
@@ -572,14 +744,9 @@ def _build_model_bundle(scan_result: _FrameScanResult, raw_ib_hash: str) -> Dete
             f"Available IB hashes: {available}"
         )
 
-    main_draw = max(
-        raw_matching_draws,
-        key=lambda record: (
-            int(record.index_count),
-            int(record.event_index),
-        ),
-    )
+    main_draw = max(raw_matching_draws, key=_g_buffer_draw_score)
     post_cs_vb0_hash = _normalize_hash(main_draw.vb0_hash)
+    post_cs_vb0_identity = _normalize_hash(main_draw.vb0_identity)
     if not post_cs_vb0_hash or not main_draw.vb0_buf_path:
         raise ValueError(f"Could not resolve the post-CS VB0 for IB hash {raw_ib_hash}")
 
@@ -587,11 +754,18 @@ def _build_model_bundle(scan_result: _FrameScanResult, raw_ib_hash: str) -> Dete
     # the complete skinned model, keep the draw slices that consume the same final
     # post-CS VB0 pool as the main draw. This preserves tiny first-index=0 slices
     # such as the 366-index draw while avoiding unrelated uses of the big IB.
-    matching_draws = [
-        record
-        for record in raw_matching_draws
-        if _normalize_hash(record.vb0_hash) == post_cs_vb0_hash
-    ]
+    if post_cs_vb0_identity and "@" in post_cs_vb0_identity:
+        matching_draws = [
+            record
+            for record in raw_matching_draws
+            if _normalize_hash(record.vb0_identity) == post_cs_vb0_identity
+        ]
+    else:
+        matching_draws = [
+            record
+            for record in raw_matching_draws
+            if _normalize_hash(record.vb0_hash) == post_cs_vb0_hash
+        ]
     if not matching_draws:
         matching_draws = raw_matching_draws
 
@@ -602,6 +776,7 @@ def _build_model_bundle(scan_result: _FrameScanResult, raw_ib_hash: str) -> Dete
     dispatch_batches = _build_dispatch_batches(
         scan_result.dispatch_records,
         target_u1_hash=post_cs_vb0_hash,
+        target_u1_identity=post_cs_vb0_identity,
     )
     if not dispatch_batches:
         raise ValueError(f"Could not find producer dispatches that write {post_cs_vb0_hash}")
@@ -609,12 +784,14 @@ def _build_model_bundle(scan_result: _FrameScanResult, raw_ib_hash: str) -> Dete
     pre_cs_position_paths: list[str | None] = []
     pre_cs_weight_paths: list[str | None] = []
     pre_cs_frame_paths: list[str | None] = []
+    pre_cs_position_hashes_by_dispatch: dict[int, str | None] = {}
     for batch in dispatch_batches:
         dispatch_record = scan_result.dispatch_records[batch.dispatch_index]
         position_slot, weight_slot, frame_slot = _resolve_input_slots_for_dispatch(dispatch_record, batch.cs_hash)
         pre_cs_position_paths.append(_artifact_output(dispatch_record.resources, position_slot, "buf"))
         pre_cs_weight_paths.append(_artifact_output(dispatch_record.resources, weight_slot, "buf"))
         pre_cs_frame_paths.append(_artifact_output(dispatch_record.resources, frame_slot, "buf"))
+        pre_cs_position_hashes_by_dispatch[batch.dispatch_index] = _artifact_hash(dispatch_record.resources, position_slot)
 
     pre_cs_vb0_path = _most_common_path(pre_cs_position_paths)
     pre_cs_weight_path = _most_common_path(pre_cs_weight_paths)
@@ -640,12 +817,18 @@ def _build_model_bundle(scan_result: _FrameScanResult, raw_ib_hash: str) -> Dete
                 producer_batch = batch
 
         selected_draw = draw_group[-1]
-        depth_vs_hashes = tuple(
-            sorted({str(record.vs_hash) for record in draw_group if record.vs_hash and _draw_stage(record) == "depth"})
+        position_hash_hint = (
+            None
+            if producer_batch is None
+            else pre_cs_position_hashes_by_dispatch.get(producer_batch.dispatch_index)
         )
-        gbuffer_vs_hashes = tuple(
-            sorted({str(record.vs_hash) for record in draw_group if record.vs_hash and _draw_stage(record) == "gbuffer"})
+        texcoord_hash_hint = selected_draw.vs_resource_hashes.get("vs-t5") or selected_draw.vs_resource_hashes.get("vs-t3")
+        static_match_hashes = _infer_static_match_hashes(
+            draw_group,
+            texcoord_hash_hint=texcoord_hash_hint,
+            position_hash_hint=position_hash_hint,
         )
+        texture_slots = _infer_texture_slots(draw_group)
         slices.append(
             DetectedSlice(
                 ib_txt_path=selected_draw.ib_txt_path,
@@ -665,8 +848,10 @@ def _build_model_bundle(scan_result: _FrameScanResult, raw_ib_hash: str) -> Dete
                 last_cs_hash=None if producer_batch is None else producer_batch.cs_hash,
                 last_cs_cb0_hash=None if producer_batch is None else producer_batch.cb0_hash,
                 last_consumer_draw_index=int(draw_group[-1].event_index),
-                depth_vs_hashes=depth_vs_hashes,
-                gbuffer_vs_hashes=gbuffer_vs_hashes,
+                match_vs_texcoord_hash=static_match_hashes["texcoord"],
+                match_vs_position_hash=static_match_hashes["position"],
+                match_vs_outline_hash=static_match_hashes["outline"],
+                texture_slots=texture_slots,
             )
         )
 

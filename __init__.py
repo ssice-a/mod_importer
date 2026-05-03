@@ -8,7 +8,7 @@ bl_info = {
     "version": (0, 6, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Mod Importer",
-    "description": "Import and export profile-driven 3DMigoto model buffers and HLSL assets.",
+    "description": "Import and export NTMI fast-path model buffers and optional INI files.",
     "category": "Import-Export",
 }
 
@@ -23,12 +23,9 @@ if bpy is not None:
     REGISTERED_CLASSES = (
         operators.MODIMP_OT_resolve_from_ib_hash,
         operators.MODIMP_OT_import_resolved_model,
-        operators.MODIMP_OT_create_export_collection,
-        operators.MODIMP_OT_create_export_part,
         operators.MODIMP_OT_analyze_frame_stages,
         operators.MODIMP_OT_apply_bone_merge_map_to_groups,
         operators.MODIMP_OT_restore_vertex_group_names,
-        operators.MODIMP_OT_split_export_parts,
         operators.MODIMP_OT_export_collection_buffers,
         panel.VIEW3D_PT_mod_importer,
     )

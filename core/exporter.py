@@ -5,6 +5,10 @@ from __future__ import annotations
 import json
 import math
 import re
+import shutil
+import hashlib
+from time import perf_counter
+from functools import lru_cache
 from pathlib import Path
 
 import bpy
@@ -12,7 +16,9 @@ from mathutils import Vector
 
 from .game_data import get_game_data_converter
 from .io import (
+    write_f32_buffer,
     write_float3_buffer,
+    write_float4_buffer,
     write_half2x4_buffer,
     write_snorm8x4_pairs_buffer,
     write_u16_buffer,
@@ -24,8 +30,11 @@ from .profiles import YIHUAN_PROFILE
 
 
 _REGION_HASH_RE = re.compile(r"^[0-9A-Fa-f]{8}$")
+_RESOURCE_HASH_RE = re.compile(r"^[0-9A-Fa-f]{8,16}$")
 _REGION_COLLECTION_RE = re.compile(r"^(?P<hash>[0-9A-Fa-f]{8})(?:[-_](?P<count>\d+)(?:[-_](?P<first>\d+))?)?")
 _PART_NAME_RE = re.compile(r"^part(?P<index>\d+)", re.IGNORECASE)
+_COLLECT_KEY_RE = re.compile(r"^cs-cb0\[(?P<lane>\d+)\]$")
+_COLLECT_FINISH_TERM_RE = re.compile(r"^cs-cb0\[(?P<lane>\d+)\]\s*==\s*(?P<value>\d+)$")
 _COLLECTION_KIND_PROP = "modimp_kind"
 _PROFILE_ID_PROP = "modimp_profile_id"
 _SOURCE_IB_HASH_PROP = "modimp_source_ib_hash"
@@ -33,15 +42,6 @@ _REGION_HASH_PROP = "modimp_region_hash"
 _REGION_INDEX_COUNT_PROP = "modimp_region_index_count"
 _REGION_FIRST_INDEX_PROP = "modimp_region_first_index"
 _PART_INDEX_PROP = "modimp_part_index"
-_PRODUCER_DISPATCH_INDEX_PROP = "modimp_producer_dispatch_index"
-_PRODUCER_CS_HASH_PROP = "modimp_producer_cs_hash"
-_PRODUCER_T0_HASH_PROP = "modimp_producer_t0_hash"
-_LAST_CS_HASH_PROP = "modimp_last_cs_hash"
-_LAST_CS_CB0_HASH_PROP = "modimp_last_cs_cb0_hash"
-_LAST_CONSUMER_DRAW_INDEX_PROP = "modimp_last_consumer_draw_index"
-_DEPTH_VS_HASHES_PROP = "modimp_depth_vs_hashes"
-_GBUFFER_VS_HASHES_PROP = "modimp_gbuffer_vs_hashes"
-_STAGE_MAP_TEXT_PROP = "modimp_stage_map_text"
 _BONE_MERGE_MAP_TEXT_PROP = "modimp_bone_merge_map_text"
 _BMC_IB_HASH_PROP = "modimp_bmc_ib_hash"
 _BMC_MATCH_INDEX_COUNT_PROP = "modimp_bmc_match_index_count"
@@ -58,56 +58,23 @@ _COLLECTOR_FINISH_CONDITION_PROP = "modimp_collector_finish_condition"
 _MATCH_VS_TEXCOORD_HASH_PROP = "modimp_match_vs_texcoord_hash"
 _MATCH_VS_POSITION_HASH_PROP = "modimp_match_vs_position_hash"
 _MATCH_VS_OUTLINE_HASH_PROP = "modimp_match_vs_outline_hash"
+_TEXTURE_SLOTS_PROP = "modimp_texture_slots"
 _SHAPE_KEY_BAKE_POLICY = "bake_current_relative_mix_to_base_mesh_copy"
-_YIHUAN_DEFAULT_PRODUCER_CS_HASH = "f33fea3cca2704e4"
-_YIHUAN_DEFAULT_LAST_CS_HASH = "f33fea3cca2704e4"
-_YIHUAN_DEFAULT_LAST_CS_CB0_HASH = "7816b819"
-_YIHUAN_BODY_TEXTURE_RESOURCES = (
-    ("ResourceT5", "Texture/NM.dds"),
-    ("ResourceT7", "Texture/Body.dds"),
-    ("ResourceT8", "Texture/t8.dds"),
-    ("ResourceT18", "Texture/t18.dds"),
-)
-_YIHUAN_DEFAULT_DRAW_TOGGLES = {
-    "4c512c5c-52407-0.005": ("bohe_draw_52407_0_005", "VK_NUMPAD8"),
-    "4c512c5c-52407-0.006": ("bohe_draw_lower_group", "VK_NUMPAD2"),
-    "4c512c5c-62346-52407.002": ("bohe_draw_lower_group", "VK_NUMPAD2"),
-}
 _NTMI_CORE_GLOBAL_T0_RESOURCE = r"Resource\NTMIv1\RuntimeGlobalT0"
 _NTMI_CORE_SKIN_COMMAND = r"CommandList\NTMIv1\SkinFromBoundSlots"
+_NTMI_CORE_SKIN_SHAPEKEY_COMMAND = r"CommandList\NTMIv1\SkinWithShapekeyFromBoundSlots"
 _NTMI_CORE_VERTEX_COUNT = r"$\NTMIv1\vertex_count"
 _NTMI_DEFAULT_DYNAMIC_SLOTS = 16
-_NTMI_DEFAULT_COLLECTOR_GROUP_SLOT = "cs-u1"
-_NTMI_DEFAULT_COLLECTOR_T0_HASH = "bed2036c"
-_NTMI_DEFAULT_COLLECTOR_U0_HASH = "4c1f57af"
-_NTMI_DEFAULT_COLLECTOR_U1_HASH = "689792de"
-_NTMI_DEFAULT_COLLECT_KEY = "cs-cb0[1]"
-_NTMI_DEFAULT_FINISH_CONDITION = "cs-cb0[1] == 12675 && cs-cb0[2] == 14431"
-_NTMI_DEFAULT_MATCH_TEXCOORD_HASH = "9f1ca2bd"
-_NTMI_DEFAULT_MATCH_POSITION_HASH = "b9df1c62"
-_NTMI_DEFAULT_MATCH_OUTLINE_HASH = "7172d406"
-
-
-def _hash_tuple(value: object) -> tuple[str, ...]:
-    if value is None:
-        return ()
-    if isinstance(value, (list, tuple, set)):
-        raw_items = value
-    else:
-        raw_items = re.split(r"[,;\s]+", str(value))
-    hashes: list[str] = []
-    seen: set[str] = set()
-    for item in raw_items:
-        normalized = str(item or "").strip().lower()
-        if not normalized:
-            continue
-        if not re.fullmatch(r"[0-9a-f]{16}", normalized):
-            continue
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        hashes.append(normalized)
-    return tuple(hashes)
+_NTMI_SKIN_T_GLOBAL_T0 = "cs-t64"
+_NTMI_SKIN_T_PALETTE = "cs-t65"
+_NTMI_SKIN_T_BLEND = "cs-t66"
+_NTMI_SKIN_T_FRAME = "cs-t67"
+_NTMI_SKIN_T_POSITION = "cs-t68"
+_NTMI_SKIN_T_SHAPEKEY_STATIC = "cs-t69"
+_NTMI_SKIN_T_SHAPEKEY_RUNTIME = "cs-t70"
+_NTMI_SKIN_U_NORMAL = "cs-u6"
+_NTMI_SKIN_U_POSITION = "cs-u7"
+_SHAPEKEY_EPSILON = 1.0e-7
 
 
 def _yihuan_source_suffix(region_packages: list[dict[str, object]]) -> str:
@@ -132,6 +99,36 @@ def _ensure_directory(path: Path) -> Path:
     return path
 
 
+def _build_export_logger():
+    started = perf_counter()
+
+    def log(message: str):
+        print(f"[{perf_counter() - started:8.3f}s] [modimp-export] {message}")
+
+    def flush(*, success: bool):
+        status = "succeeded" if success else "failed"
+        print(f"[{perf_counter() - started:8.3f}s] [modimp-export] Export {status}")
+
+    return log, flush
+
+
+def _resolve_mirror_flip_for_object(obj: bpy.types.Object, *, default_value: bool = False) -> bool:
+    if _MIRROR_FLIP_PROP in obj:
+        return bool(obj.get(_MIRROR_FLIP_PROP, False))
+    return bool(default_value)
+
+
+def _format_matrix_trace(matrix: bpy.types.Matrix) -> str:
+    location = matrix.to_translation()
+    scale = matrix.to_scale()
+    det = matrix.to_3x3().determinant()
+    return (
+        f"loc=({location.x:.4f},{location.y:.4f},{location.z:.4f}) "
+        f"scale=({scale.x:.4f},{scale.y:.4f},{scale.z:.4f}) "
+        f"det3x3={det:.6f}"
+    )
+
+
 def _get_collection(collection_name: str) -> bpy.types.Collection:
     collection = bpy.data.collections.get(collection_name)
     if collection is None:
@@ -147,11 +144,33 @@ def _export_object_sort_key(obj: bpy.types.Object) -> tuple[int, str]:
     return slice_order, obj.name
 
 
+def _active_constraint_labels(obj: bpy.types.Object) -> list[str]:
+    labels: list[str] = []
+    for constraint in getattr(obj, "constraints", []):
+        if bool(getattr(constraint, "mute", False)):
+            continue
+        labels.append(f"{constraint.type}:{constraint.name}")
+    return labels
+
+
 def _optional_int_collection_prop(collection: bpy.types.Collection, key: str) -> int | None:
     if key not in collection:
         return None
     try:
         return int(collection[key])
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_str_object_prop(obj: bpy.types.Object, key: str) -> str:
+    return str(obj.get(key, "") or "").strip().lower()
+
+
+def _optional_int_object_prop(obj: bpy.types.Object, key: str) -> int | None:
+    if key not in obj:
+        return None
+    try:
+        return int(obj[key])
     except (TypeError, ValueError):
         return None
 
@@ -318,11 +337,11 @@ def _bake_current_shape_key_mix(mesh_copy: bpy.types.Mesh, obj: bpy.types.Object
     return baked_names
 
 
-def _triangulated_mesh_copy(
+def _evaluated_triangulated_mesh_copy(
     obj: bpy.types.Object,
     *,
     depsgraph: bpy.types.Depsgraph | None = None,
-) -> tuple[bpy.types.Mesh, list[str]]:
+) -> bpy.types.Mesh:
     import bmesh
 
     depsgraph = depsgraph or bpy.context.evaluated_depsgraph_get()
@@ -341,7 +360,6 @@ def _triangulated_mesh_copy(
     # Export the final visible result, including object/world transforms such as section transforms.
     mesh_copy.transform(evaluated_obj.matrix_world)
     mesh_copy.update()
-    baked_shape_keys = _active_shape_key_mix_names(obj)
     if any(polygon.loop_total != 3 for polygon in mesh_copy.polygons):
         bm = bmesh.new()
         try:
@@ -352,6 +370,16 @@ def _triangulated_mesh_copy(
             bm.free()
     mesh_copy.update()
     mesh_copy.calc_loop_triangles()
+    return mesh_copy
+
+
+def _triangulated_mesh_copy(
+    obj: bpy.types.Object,
+    *,
+    depsgraph: bpy.types.Depsgraph | None = None,
+) -> tuple[bpy.types.Mesh, list[str]]:
+    mesh_copy = _evaluated_triangulated_mesh_copy(obj, depsgraph=depsgraph)
+    baked_shape_keys = _active_shape_key_mix_names(obj)
     return mesh_copy, baked_shape_keys
 
 
@@ -364,6 +392,10 @@ def _normalized_vector(vector: tuple[float, float, float]) -> tuple[float, float
 
 def _mirror_x_vector(vector: tuple[float, float, float]) -> tuple[float, float, float]:
     return (-float(vector[0]), float(vector[1]), float(vector[2]))
+
+
+def _reverse_triangle_winding(triangle: tuple[int, int, int]) -> tuple[int, int, int]:
+    return (triangle[0], triangle[2], triangle[1])
 
 
 def _vector_key(vector: tuple[float, float, float]) -> tuple[int, int, int]:
@@ -390,6 +422,243 @@ def _prepare_loop_tangent_frames(
     finally:
         if hasattr(mesh, "free_tangents"):
             mesh.free_tangents()
+
+
+def _parse_runtime_shapekey_names(value: str | None) -> list[str] | None:
+    if value is None:
+        return None
+    names = [item.strip() for item in re.split(r"[,;\n]+", value) if item.strip()]
+    if not names:
+        return None
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for name in names:
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(name)
+    return ordered
+
+
+def _iter_mesh_objects(collection: bpy.types.Collection) -> list[bpy.types.Object]:
+    objects: list[bpy.types.Object] = []
+    seen: set[str] = set()
+
+    def visit(current: bpy.types.Collection):
+        for obj in sorted(current.objects, key=lambda item: item.name):
+            if obj.type != "MESH" or obj.name in seen:
+                continue
+            seen.add(obj.name)
+            objects.append(obj)
+        for child in sorted(current.children, key=lambda item: item.name):
+            visit(child)
+
+    visit(collection)
+    return objects
+
+
+def _runtime_shapekey_order(
+    collection: bpy.types.Collection,
+    requested_names: list[str] | None,
+) -> list[str]:
+    if requested_names is not None:
+        return requested_names
+
+    names: list[str] = []
+    seen: set[str] = set()
+    for obj in _iter_mesh_objects(collection):
+        shape_keys = obj.data.shape_keys
+        if shape_keys is None or not getattr(shape_keys, "use_relative", True):
+            continue
+        key_blocks = getattr(shape_keys, "key_blocks", None)
+        if key_blocks is None or len(key_blocks) <= 1:
+            continue
+        basis = key_blocks.get("Basis") or key_blocks[0]
+        for key_block in key_blocks:
+            if key_block == basis or bool(getattr(key_block, "mute", False)):
+                continue
+            name = str(key_block.name)
+            key = name.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            names.append(name)
+    return names
+
+
+def _shape_vector_length_sq(vector: tuple[float, ...]) -> float:
+    return sum(float(component) * float(component) for component in vector)
+
+
+def _row_delta(
+    after: tuple[float, float, float, float],
+    before: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    return tuple(float(a) - float(b) for a, b in zip(after, before))
+
+
+def _restore_shape_key_state(
+    key_block: bpy.types.ShapeKey,
+    *,
+    value: float,
+    slider_min: float,
+    slider_max: float,
+):
+    key_block.slider_min = slider_min
+    key_block.slider_max = slider_max
+    key_block.value = value
+
+
+def _evaluate_shape_key_frame_delta_by_loop(
+    obj: bpy.types.Object,
+    key_block: bpy.types.ShapeKey,
+    *,
+    initial_value: float,
+    current_mesh: bpy.types.Mesh,
+    current_loop_frames: tuple[list[tuple[float, float, float]], list[tuple[float, float, float]], list[float]],
+    converter,
+    mirror_flip: bool,
+    uv_layer_name: str,
+    depsgraph: bpy.types.Depsgraph,
+) -> list[tuple[tuple[float, float, float, float], tuple[float, float, float, float]]] | None:
+    original_value = float(key_block.value)
+    original_min = float(key_block.slider_min)
+    original_max = float(key_block.slider_max)
+    target_value = initial_value + 1.0
+    altered_mesh: bpy.types.Mesh | None = None
+    try:
+        key_block.slider_min = min(original_min, target_value)
+        key_block.slider_max = max(original_max, target_value)
+        key_block.value = target_value
+        bpy.context.view_layer.update()
+        altered_mesh = _evaluated_triangulated_mesh_copy(obj, depsgraph=depsgraph)
+        if len(altered_mesh.loops) != len(current_mesh.loops):
+            return None
+        altered_loop_frames = _prepare_loop_tangent_frames(altered_mesh, uv_layer_name=uv_layer_name)
+        if altered_loop_frames is None:
+            return None
+
+        current_tangents, current_normals, current_signs = current_loop_frames
+        altered_tangents, altered_normals, altered_signs = altered_loop_frames
+        deltas: list[tuple[tuple[float, float, float, float], tuple[float, float, float, float]]] = []
+        for loop_index in range(len(current_mesh.loops)):
+            current_tangent = current_tangents[loop_index]
+            current_normal = current_normals[loop_index]
+            current_sign = current_signs[loop_index]
+            altered_tangent = altered_tangents[loop_index]
+            altered_normal = altered_normals[loop_index]
+            altered_sign = altered_signs[loop_index]
+            if mirror_flip:
+                current_tangent = _mirror_x_vector(current_tangent)
+                current_normal = _mirror_x_vector(current_normal)
+                current_sign = -current_sign
+                altered_tangent = _mirror_x_vector(altered_tangent)
+                altered_normal = _mirror_x_vector(altered_normal)
+                altered_sign = -altered_sign
+
+            current_a, current_b = converter.encode_pre_cs_frames(
+                [current_tangent],
+                [current_normal],
+                [current_sign],
+            )
+            altered_a, altered_b = converter.encode_pre_cs_frames(
+                [altered_tangent],
+                [altered_normal],
+                [altered_sign],
+            )
+            deltas.append((_row_delta(altered_a[0], current_a[0]), _row_delta(altered_b[0], current_b[0])))
+        return deltas
+    finally:
+        if altered_mesh is not None:
+            bpy.data.meshes.remove(altered_mesh)
+        _restore_shape_key_state(
+            key_block,
+            value=original_value,
+            slider_min=original_min,
+            slider_max=original_max,
+        )
+        bpy.context.view_layer.update()
+
+
+def _prepare_runtime_shapekey_sources(
+    obj: bpy.types.Object,
+    *,
+    mesh: bpy.types.Mesh,
+    loop_frames: tuple[list[tuple[float, float, float]], list[tuple[float, float, float]], list[float]] | None,
+    converter,
+    mirror_flip: bool,
+    runtime_shapekey_names: list[str],
+    depsgraph: bpy.types.Depsgraph,
+) -> tuple[list[dict[str, object]], list[str]]:
+    if not runtime_shapekey_names:
+        return [], []
+    shape_keys = obj.data.shape_keys
+    if shape_keys is None or not getattr(shape_keys, "use_relative", True):
+        return [], []
+    key_blocks = getattr(shape_keys, "key_blocks", None)
+    if key_blocks is None or len(key_blocks) <= 1:
+        return [], []
+    if len(obj.data.vertices) != len(mesh.vertices):
+        return [], [f"{obj.name}: runtime shapekey skipped because evaluated vertex count differs from source mesh"]
+
+    basis = key_blocks.get("Basis") or key_blocks[0]
+    object_linear = obj.matrix_world.to_3x3()
+    selected = {name.casefold(): name for name in runtime_shapekey_names}
+    sources: list[dict[str, object]] = []
+    warnings: list[str] = []
+    for key_block in key_blocks:
+        if key_block == basis:
+            continue
+        name = str(key_block.name)
+        if name.casefold() not in selected:
+            continue
+        if bool(getattr(key_block, "mute", False)):
+            warnings.append(f"{obj.name}: runtime shapekey '{name}' is muted and was skipped")
+            continue
+        if len(key_block.data) != len(obj.data.vertices):
+            warnings.append(f"{obj.name}: runtime shapekey '{name}' has incompatible vertex count")
+            continue
+        relative_key = getattr(key_block, "relative_key", None) or basis
+        if relative_key != basis:
+            warnings.append(f"{obj.name}: runtime shapekey '{name}' is not relative to Basis and was baked only")
+            continue
+        group_weights = _shape_key_group_weights(obj, key_block, len(obj.data.vertices))
+        position_deltas: list[tuple[float, float, float]] = []
+        for vertex_index in range(len(obj.data.vertices)):
+            influence = 1.0 if group_weights is None else float(group_weights[vertex_index])
+            delta = (key_block.data[vertex_index].co - basis.data[vertex_index].co) * influence
+            world_delta = object_linear @ delta
+            export_delta = (float(world_delta.x), float(world_delta.y), float(world_delta.z))
+            if mirror_flip:
+                export_delta = _mirror_x_vector(export_delta)
+            position_deltas.append(converter.from_blender_position(export_delta))
+
+        frame_deltas = None
+        if loop_frames is not None:
+            frame_deltas = _evaluate_shape_key_frame_delta_by_loop(
+                obj,
+                key_block,
+                initial_value=float(key_block.value),
+                current_mesh=mesh,
+                current_loop_frames=loop_frames,
+                converter=converter,
+                mirror_flip=mirror_flip,
+                uv_layer_name=(mesh.uv_layers.active.name if mesh.uv_layers.active else ""),
+                depsgraph=depsgraph,
+            )
+        if frame_deltas is None:
+            warnings.append(f"{obj.name}: runtime shapekey '{name}' frame delta defaulted to zero")
+
+        sources.append(
+            {
+                "name": name,
+                "initial_weight": float(key_block.value),
+                "position_deltas": position_deltas,
+                "frame_deltas": frame_deltas,
+            }
+        )
+    return sources, warnings
 
 
 def _numeric_vertex_group_ids(obj: bpy.types.Object) -> dict[int, int]:
@@ -493,12 +762,10 @@ def _extract_object_payload(
     profile_id: str | None = None,
     original_first_index: int | None = None,
     original_index_count: int | None = None,
-    producer_dispatch_index: int | None = None,
-    producer_cs_hash: str | None = None,
-    producer_t0_hash: str | None = None,
-    last_cs_hash: str | None = None,
-    last_cs_cb0_hash: str | None = None,
-    last_consumer_draw_index: int | None = None,
+    export_runtime_shapekeys: bool = False,
+    runtime_shapekey_names: list[str] | None = None,
+    default_mirror_flip: bool = False,
+    log=None,
 ) -> dict[str, object]:
     if obj.type != "MESH":
         raise ValueError(f"{obj.name}: only mesh objects can be exported")
@@ -506,11 +773,19 @@ def _extract_object_payload(
     if profile_id != YIHUAN_PROFILE.profile_id:
         raise ValueError(f"{obj.name}: unsupported profile id")
     converter = get_game_data_converter(profile_id)
-    mirror_flip = bool(obj.get(_MIRROR_FLIP_PROP, False))
+    mirror_flip = _resolve_mirror_flip_for_object(obj, default_value=default_mirror_flip)
 
     depsgraph = bpy.context.evaluated_depsgraph_get()
     missing_optional_attributes: list[str] = []
     mesh_copy, baked_shape_keys = _triangulated_mesh_copy(obj, depsgraph=depsgraph)
+    if log is not None:
+        mirror_flip = _resolve_mirror_flip_for_object(obj, default_value=default_mirror_flip)
+        log(
+            f"{obj.name}: evaluated mesh -> source_verts={len(obj.data.vertices)}, "
+            f"source_polys={len(obj.data.polygons)}, eval_verts={len(mesh_copy.vertices)}, "
+            f"loops={len(mesh_copy.loops)}, polys={len(mesh_copy.polygons)}, "
+            f"{_format_matrix_trace(obj.matrix_world)}, mirror_flip={mirror_flip}"
+        )
     blend_indices, blend_weights, local_palette_count = _normalized_top4_weights(
         obj,
         mesh=mesh_copy,
@@ -532,6 +807,18 @@ def _extract_object_payload(
     loop_frames = _prepare_loop_tangent_frames(mesh_copy, uv_layer_name=uv0_layer.name)
     if loop_frames is None:
         missing_optional_attributes.append("rebuild_tangent_frame_failed")
+    runtime_shapekey_sources: list[dict[str, object]] = []
+    if export_runtime_shapekeys and runtime_shapekey_names:
+        runtime_shapekey_sources, shapekey_warnings = _prepare_runtime_shapekey_sources(
+            obj,
+            mesh=mesh_copy,
+            loop_frames=loop_frames,
+            converter=converter,
+            mirror_flip=mirror_flip,
+            runtime_shapekey_names=runtime_shapekey_names,
+            depsgraph=depsgraph,
+        )
+        missing_optional_attributes.extend(shapekey_warnings)
 
     positions: list[tuple[float, float, float]] = []
     packed_uv_entries: list[tuple[tuple[float, float], tuple[float, float], tuple[float, float], tuple[float, float]]] = []
@@ -541,6 +828,8 @@ def _extract_object_payload(
     decoded_normals: list[tuple[float, float, float]] = []
     decoded_signs: list[float] = []
     outline_params: list[tuple[int, int, int, int]] = []
+    shapekey_vertex_records: list[list[dict[str, object]]] = []
+    shapekey_initial_weights: dict[str, float] = {}
     triangles: list[tuple[int, int, int]] = []
     remap: dict[tuple[object, ...], int] = {}
 
@@ -626,11 +915,44 @@ def _extract_object_payload(
                     decoded_normals.append(decoded_normal)
                     decoded_signs.append(decoded_sign)
                     outline_params.append((255, 255, 255, 255))
+                    vertex_shapekey_records: list[dict[str, object]] = []
+                    for shapekey_source in runtime_shapekey_sources:
+                        shapekey_name = str(shapekey_source["name"])
+                        shapekey_initial_weights[shapekey_name] = float(shapekey_source["initial_weight"])
+                        position_delta = shapekey_source["position_deltas"][source_vertex_index]
+                        frame_deltas = shapekey_source.get("frame_deltas")
+                        if frame_deltas is None:
+                            frame_a_delta = (0.0, 0.0, 0.0, 0.0)
+                            frame_b_delta = (0.0, 0.0, 0.0, 0.0)
+                        else:
+                            frame_a_delta, frame_b_delta = frame_deltas[loop_index]
+                        if (
+                            _shape_vector_length_sq(position_delta) <= _SHAPEKEY_EPSILON
+                            and _shape_vector_length_sq(frame_a_delta) <= _SHAPEKEY_EPSILON
+                            and _shape_vector_length_sq(frame_b_delta) <= _SHAPEKEY_EPSILON
+                        ):
+                            continue
+                        vertex_shapekey_records.append(
+                            {
+                                "name": shapekey_name,
+                                "position_delta": position_delta,
+                                "frame_a_delta": frame_a_delta,
+                                "frame_b_delta": frame_b_delta,
+                            }
+                        )
+                    shapekey_vertex_records.append(vertex_shapekey_records)
                     out_vertex_index = len(positions) - 1
                     remap[key] = out_vertex_index
                 triangle.append(out_vertex_index)
-            # Export the evaluated Blender mesh as-is; no hidden winding fixup.
-            triangles.append(tuple(triangle))
+            # If import used Mirror Flip, the X reflection already handled
+            # winding both ways. Otherwise write the inverse order back to the
+            # game IB while preserving custom normals.
+            blender_triangle = tuple(triangle)
+            triangles.append(
+                blender_triangle
+                if mirror_flip
+                else _reverse_triangle_winding(blender_triangle)
+            )
     finally:
         bpy.data.meshes.remove(mesh_copy)
 
@@ -639,14 +961,6 @@ def _extract_object_payload(
         original_first_index = 0
     if original_index_count is None:
         original_index_count = len(triangles) * 3
-    if producer_dispatch_index is None:
-        producer_dispatch_index = 0
-    producer_cs_hash = (producer_cs_hash or _YIHUAN_DEFAULT_PRODUCER_CS_HASH).strip()
-    producer_t0_hash = (producer_t0_hash or "").strip()
-    last_cs_hash = (last_cs_hash or _YIHUAN_DEFAULT_LAST_CS_HASH).strip()
-    last_cs_cb0_hash = (last_cs_cb0_hash or _YIHUAN_DEFAULT_LAST_CS_CB0_HASH).strip()
-    if last_consumer_draw_index is None:
-        last_consumer_draw_index = 0
 
     return {
         "object_name": obj.name,
@@ -660,17 +974,13 @@ def _extract_object_payload(
         "frame_a": frame_a,
         "frame_b": frame_b,
         "outline_params": outline_params,
+        "shapekey_vertex_records": shapekey_vertex_records,
+        "shapekey_initial_weights": shapekey_initial_weights,
         "local_palette_count": local_palette_count,
         "baked_shape_keys": baked_shape_keys,
         "missing_optional_attributes": sorted(set(missing_optional_attributes)),
         "original_first_index": int(original_first_index),
         "original_index_count": int(original_index_count),
-        "producer_dispatch_index": int(producer_dispatch_index),
-        "producer_cs_hash": producer_cs_hash,
-        "producer_t0_hash": producer_t0_hash,
-        "last_cs_hash": last_cs_hash,
-        "last_cs_cb0_hash": last_cs_cb0_hash,
-        "last_consumer_draw_index": int(last_consumer_draw_index),
     }
 
 
@@ -729,20 +1039,10 @@ def _collection_runtime_contract(
 ) -> dict[str, object]:
     """Read the export/runtime contract from the region collection."""
     profile_id = _optional_str_collection_prop(collection, _PROFILE_ID_PROP) or YIHUAN_PROFILE.profile_id
-    producer_dispatch_index = _optional_int_collection_prop(collection, _PRODUCER_DISPATCH_INDEX_PROP)
-    last_consumer_draw_index = _optional_int_collection_prop(collection, _LAST_CONSUMER_DRAW_INDEX_PROP)
     return {
         "profile_id": profile_id,
         "original_first_index": region_first_index,
         "original_index_count": region_index_count,
-        "producer_dispatch_index": producer_dispatch_index,
-        "producer_cs_hash": _optional_str_collection_prop(collection, _PRODUCER_CS_HASH_PROP),
-        "producer_t0_hash": _optional_str_collection_prop(collection, _PRODUCER_T0_HASH_PROP),
-        "last_cs_hash": _optional_str_collection_prop(collection, _LAST_CS_HASH_PROP),
-        "last_cs_cb0_hash": _optional_str_collection_prop(collection, _LAST_CS_CB0_HASH_PROP),
-        "last_consumer_draw_index": last_consumer_draw_index,
-        "depth_vs_hashes": _optional_str_collection_prop(collection, _DEPTH_VS_HASHES_PROP),
-        "gbuffer_vs_hashes": _optional_str_collection_prop(collection, _GBUFFER_VS_HASHES_PROP),
         "collector_group_slot": _optional_str_collection_prop(collection, _COLLECTOR_GROUP_SLOT_PROP),
         "collector_t0_hash": _optional_str_collection_prop(collection, _COLLECTOR_T0_HASH_PROP),
         "collector_u0_hash": _optional_str_collection_prop(collection, _COLLECTOR_U0_HASH_PROP),
@@ -752,6 +1052,7 @@ def _collection_runtime_contract(
         "match_vs_texcoord_hash": _optional_str_collection_prop(collection, _MATCH_VS_TEXCOORD_HASH_PROP),
         "match_vs_position_hash": _optional_str_collection_prop(collection, _MATCH_VS_POSITION_HASH_PROP),
         "match_vs_outline_hash": _optional_str_collection_prop(collection, _MATCH_VS_OUTLINE_HASH_PROP),
+        "texture_slots": _optional_str_collection_prop(collection, _TEXTURE_SLOTS_PROP),
     }
 
 
@@ -769,18 +1070,16 @@ def _validate_region_collection_contract(
         missing.append(_REGION_FIRST_INDEX_PROP)
     if require_runtime_contract:
         for key in (
-            _PRODUCER_CS_HASH_PROP,
-            _PRODUCER_T0_HASH_PROP,
-            _LAST_CS_HASH_PROP,
-            _LAST_CS_CB0_HASH_PROP,
+            _MATCH_VS_TEXCOORD_HASH_PROP,
+            _MATCH_VS_POSITION_HASH_PROP,
         ):
             if not _optional_str_collection_prop(collection, key):
                 missing.append(key)
     if missing:
         raise ValueError(
             f"Region collection '{collection.name}' is missing export contract field(s): {', '.join(missing)}. "
-            "Use Create Export Collection/Part after resolving the source IB from FrameAnalysis, "
-            "or set these custom properties on the region collection."
+            "Re-run FrameAnalysis/Profile with the updated analyzer or set these custom properties "
+            "on the region collection."
         )
 
 
@@ -838,7 +1137,7 @@ def _part_collection_index(collection: bpy.types.Collection) -> int:
         if match:
             return int(match.group("index"))
     raise ValueError(
-        f"Part collection '{collection.name}' must be created by Create Export Part or named like part00."
+        f"Part collection '{collection.name}' must define modimp_part_index or be named like part00."
     )
 
 
@@ -893,7 +1192,7 @@ def _resolve_region_collections(root_collection: bpy.types.Collection) -> list[b
             )
         raise ValueError(
             f"Export root '{root_collection.name}' has no region children. "
-            "Use Create Export Part to create <sourceIB>/<regionHash>/partNN."
+            "Import/analyze the source IB to seed region collections, or create region collections manually."
         )
     return region_collections
 
@@ -1022,7 +1321,7 @@ def _build_part_palette(mesh_objects: list[bpy.types.Object], *, part_name: str)
         if len(object_bones) > 0x100:
             raise ValueError(
                 f"{obj.name}: uses {len(object_bones)} numeric vertex groups, exceeding the uint8 BLENDINDICES limit. "
-                "Split this object before export; the first bridge pass does not cut one object by triangles."
+                "Split this object before export; this pass does not cut one object by triangles."
             )
         global_bone_ids.update(object_bones)
 
@@ -1031,7 +1330,7 @@ def _build_part_palette(mesh_objects: list[bpy.types.Object], *, part_name: str)
     if len(global_bone_ids) > 0x100:
         raise ValueError(
             f"{part_name}: objects in this export IB use {len(global_bone_ids)} unique bones. "
-            "Run the collection split tool so each IB sub-collection uses <= 256 bones."
+            "Keep each export sub-collection within 256 bones or let export auto-split by object."
         )
 
     palette = sorted(global_bone_ids)
@@ -1063,6 +1362,68 @@ def _write_index_buffer_auto(path: Path, indices: list[int]) -> str:
     return "DXGI_FORMAT_R32_UINT"
 
 
+def _register_runtime_shapekey_initial(
+    initial_weights: dict[str, float],
+    key_name: str,
+    value: float,
+    *,
+    source_name: str,
+):
+    existing = initial_weights.get(key_name)
+    if existing is None:
+        initial_weights[key_name] = float(value)
+        return
+    if abs(existing - float(value)) > 1.0e-5:
+        raise ValueError(
+            f"Runtime shapekey '{key_name}' has conflicting initial weights "
+            f"({existing:.6f} vs {float(value):.6f}) at {source_name}. "
+            "Use distinct shapekey names or align their Blender values before export."
+        )
+
+
+def _write_shapekey_static_buffer(
+    path: Path,
+    *,
+    vertex_records: list[list[dict[str, object]]],
+    key_index_by_name: dict[str, int],
+    initial_weights: dict[str, float],
+) -> tuple[int, int]:
+    key_count = len(key_index_by_name)
+    flattened_records: list[dict[str, object]] = []
+    vertex_headers: list[tuple[int, int]] = []
+    for records in vertex_records:
+        offset = len(flattened_records)
+        for record in records:
+            if str(record.get("name", "")) not in key_index_by_name:
+                continue
+            flattened_records.append(record)
+        vertex_headers.append((offset, len(flattened_records) - offset))
+
+    if not flattened_records or key_count <= 0:
+        return 0, 0
+
+    rows: list[tuple[float, float, float, float]] = [
+        (float(len(vertex_records)), float(key_count), float(len(flattened_records)), 0.0)
+    ]
+    rows.extend((float(offset), float(count), 0.0, 0.0) for offset, count in vertex_headers)
+
+    key_names_by_index = sorted(key_index_by_name, key=lambda name: key_index_by_name[name])
+    for key_name in key_names_by_index:
+        rows.append((float(initial_weights.get(key_name, 0.0)), 0.0, 1.0, 0.0))
+
+    for record in flattened_records:
+        key_index = key_index_by_name[str(record["name"])]
+        position_delta = tuple(float(value) for value in record["position_delta"])
+        frame_a_delta = tuple(float(value) for value in record["frame_a_delta"])
+        frame_b_delta = tuple(float(value) for value in record["frame_b_delta"])
+        rows.append((float(key_index), position_delta[0], position_delta[1], position_delta[2]))
+        rows.append((frame_a_delta[0], frame_a_delta[1], frame_a_delta[2], frame_a_delta[3]))
+        rows.append((frame_b_delta[0], frame_b_delta[1], frame_b_delta[2], frame_b_delta[3]))
+
+    write_float4_buffer(str(path), rows)
+    return len(flattened_records), len(rows)
+
+
 def _export_part_buffers(
     *,
     part_definition: dict[str, object],
@@ -1073,6 +1434,11 @@ def _export_part_buffers(
     region_runtime_contract: dict[str, object],
     buffer_dir: Path,
     flip_uv_v: bool,
+    default_mirror_flip: bool,
+    export_runtime_shapekeys: bool,
+    runtime_shapekey_names: list[str],
+    runtime_shapekey_initial_weights: dict[str, float],
+    log=None,
 ) -> dict[str, object]:
     part_name = str(part_definition["part_name"])
     part_token = _resource_token(part_name)
@@ -1102,12 +1468,35 @@ def _export_part_buffers(
     all_frame_a: list[tuple[float, float, float, float]] = []
     all_frame_b: list[tuple[float, float, float, float]] = []
     all_outline_params: list[tuple[int, int, int, int]] = []
+    all_shapekey_vertex_records: list[list[dict[str, object]]] = []
     draw_records: list[dict[str, object]] = []
 
     vertex_cursor = 0
     index_cursor = 0
     required_local_palette_count = 0
     for draw_index, obj in enumerate(mesh_objects):
+        if log is not None:
+            constraint_labels = _active_constraint_labels(obj)
+            parent_name = obj.parent.name if getattr(obj, "parent", None) is not None else "-"
+            modifier_labels = [f"{mod.type}:{mod.name}" for mod in obj.modifiers[:6]]
+            used_bones = sorted(_used_numeric_bone_ids(obj))
+            log(
+                f"{part_name}: bake {obj.name} "
+                f"(parent={parent_name}, constraints={len(constraint_labels)}, "
+                f"modifiers={len(obj.modifiers)}, source_verts={len(obj.data.vertices)}, "
+                f"source_polys={len(obj.data.polygons)}, used_bones={len(used_bones)}, "
+                f"mirror_flip={bool(obj.get(_MIRROR_FLIP_PROP, False))})"
+            )
+            log(f"{obj.name}: object transform -> {_format_matrix_trace(obj.matrix_world)}")
+            if used_bones:
+                sample = ", ".join(str(value) for value in used_bones[:12])
+                if len(used_bones) > 12:
+                    sample += ", ..."
+                log(f"{obj.name}: numeric bones sample -> [{sample}]")
+            if modifier_labels:
+                log(f"{obj.name}: modifiers -> {', '.join(modifier_labels)}")
+            if constraint_labels:
+                log(f"{obj.name}: active constraints -> {', '.join(constraint_labels[:4])}")
         payload = _extract_object_payload(
             obj,
             flip_uv_v=flip_uv_v,
@@ -1115,12 +1504,10 @@ def _export_part_buffers(
             profile_id=str(region_runtime_contract.get("profile_id") or ""),
             original_first_index=region_first_index,
             original_index_count=region_index_count,
-            producer_dispatch_index=region_runtime_contract.get("producer_dispatch_index"),
-            producer_cs_hash=str(region_runtime_contract.get("producer_cs_hash") or ""),
-            producer_t0_hash=str(region_runtime_contract.get("producer_t0_hash") or ""),
-            last_cs_hash=str(region_runtime_contract.get("last_cs_hash") or ""),
-            last_cs_cb0_hash=str(region_runtime_contract.get("last_cs_cb0_hash") or ""),
-            last_consumer_draw_index=region_runtime_contract.get("last_consumer_draw_index"),
+            export_runtime_shapekeys=export_runtime_shapekeys,
+            runtime_shapekey_names=runtime_shapekey_names,
+            default_mirror_flip=default_mirror_flip,
+            log=log,
         )
         positions = payload["positions"]
         triangles = payload["triangles"]
@@ -1130,6 +1517,15 @@ def _export_part_buffers(
         frame_a = payload["frame_a"]
         frame_b = payload["frame_b"]
         outline_params = payload["outline_params"]
+        shapekey_vertex_records = payload["shapekey_vertex_records"]
+        if log is not None:
+            log(
+                f"{obj.name}: {len(positions)} verts, {len(triangles)} tris, "
+                f"palette={int(payload['local_palette_count'])}, "
+                f"shapekey_records={sum(len(records) for records in shapekey_vertex_records)}, "
+                f"drawindexed=({len(triangles) * 3},{index_cursor},0), "
+                f"orig=({int(payload['original_index_count'])},{int(payload['original_first_index'])},0)"
+            )
 
         if len(positions) != len(packed_uv_entries):
             raise ValueError(f"{obj.name}: packed UV entry count does not match position count")
@@ -1139,6 +1535,15 @@ def _export_part_buffers(
             raise ValueError(f"{obj.name}: frame payload count does not match position count")
         if len(positions) != len(outline_params):
             raise ValueError(f"{obj.name}: outline parameter count does not match position count")
+        if len(positions) != len(shapekey_vertex_records):
+            raise ValueError(f"{obj.name}: shapekey record count does not match position count")
+        for key_name, initial_weight in dict(payload["shapekey_initial_weights"]).items():
+            _register_runtime_shapekey_initial(
+                runtime_shapekey_initial_weights,
+                str(key_name),
+                float(initial_weight),
+                source_name=obj.name,
+            )
 
         vertex_start = vertex_cursor
         first_index = index_cursor
@@ -1156,6 +1561,7 @@ def _export_part_buffers(
         all_frame_a.extend(frame_a)
         all_frame_b.extend(frame_b)
         all_outline_params.extend(outline_params)
+        all_shapekey_vertex_records.extend(shapekey_vertex_records)
 
         # The collection tree is the export contract; object metadata is not used for draw identity.
         slice_hash = region_hash
@@ -1181,12 +1587,6 @@ def _export_part_buffers(
                 "drawindexed": [index_count, first_index, 0],
                 "original_first_index": int(payload["original_first_index"]),
                 "original_index_count": int(payload["original_index_count"]),
-                "producer_dispatch_index": int(payload["producer_dispatch_index"]),
-                "producer_cs_hash": str(payload["producer_cs_hash"]),
-                "producer_t0_hash": str(payload["producer_t0_hash"]),
-                "last_cs_hash": str(payload["last_cs_hash"]),
-                "last_cs_cb0_hash": str(payload["last_cs_cb0_hash"]),
-                "last_consumer_draw_index": int(payload["last_consumer_draw_index"]),
                 "shape_key_policy": _SHAPE_KEY_BAKE_POLICY,
                 "baked_shape_keys": list(payload["baked_shape_keys"]),
                 "missing_optional_attributes": list(payload["missing_optional_attributes"]),
@@ -1212,6 +1612,19 @@ def _export_part_buffers(
         "packed_uv": f"{part_name}-texcoord.buf",
         "outline_param": f"{part_name}-outline.buf",
     }
+    shapekey_record_count = 0
+    shapekey_static_row_count = 0
+    if export_runtime_shapekeys and runtime_shapekey_names:
+        files["shapekey_static"] = f"{part_name}-shapekey-static.buf"
+        key_index_by_name = {name: index for index, name in enumerate(runtime_shapekey_names)}
+        shapekey_record_count, shapekey_static_row_count = _write_shapekey_static_buffer(
+            buffer_dir / files["shapekey_static"],
+            vertex_records=all_shapekey_vertex_records,
+            key_index_by_name=key_index_by_name,
+            initial_weights=runtime_shapekey_initial_weights,
+        )
+        if shapekey_record_count <= 0:
+            del files["shapekey_static"]
 
     ib_format = _write_index_buffer_auto(buffer_dir / files["ib"], all_indices)
     write_float3_buffer(str(buffer_dir / files["vb0_pre_cs"]), all_positions)
@@ -1220,6 +1633,12 @@ def _export_part_buffers(
     write_half2x4_buffer(str(buffer_dir / files["packed_uv"]), all_packed_uv_entries)
     write_u8x4_buffer(str(buffer_dir / files["outline_param"]), all_outline_params)
     write_u32_buffer(str(buffer_dir / bmc_palette_file), palette_entries)
+
+    if log is not None:
+        log(
+            f"{part_name}: wrote {len(all_positions)} verts, {len(all_indices)} indices, "
+            f"palette entries={len(palette_entries)}"
+        )
 
     return {
         "part_index": int(part_definition["part_index"]),
@@ -1235,9 +1654,6 @@ def _export_part_buffers(
         "triangle_count": len(all_indices) // 3,
         "buffers": files,
         "draws": draw_records,
-        "producer_t0_hash": str(region_runtime_contract.get("producer_t0_hash") or ""),
-        "last_cs_cb0_hash": str(region_runtime_contract.get("last_cs_cb0_hash") or ""),
-        "last_cs_hash": str(region_runtime_contract.get("last_cs_hash") or ""),
         "expected_palette_file": bmc_palette_file,
         "expected_palette_provider": "exported_vertex_groups",
         "palette_entries": palette_entries,
@@ -1248,14 +1664,9 @@ def _export_part_buffers(
         "bmc_chunk_index": int(bmc_chunk_index),
         "local_palette_count": palette_entry_count,
         "required_local_palette_count": required_local_palette_count,
+        "shapekey_record_count": shapekey_record_count,
+        "shapekey_static_row_count": shapekey_static_row_count,
     }
-
-
-def _draws_for_ini(parts: list[dict[str, object]]) -> list[dict[str, object]]:
-    draws: list[dict[str, object]] = []
-    for part in parts:
-        draws.extend(part["draws"])
-    return draws
 
 
 def _collection_json_text(collection: bpy.types.Collection, key: str) -> dict[str, object]:
@@ -1309,11 +1720,6 @@ def _draw_toggle_for_draw(draw: dict[str, object]) -> tuple[str, str] | None:
     explicit_key = str(draw.get("draw_toggle_key", "") or "").strip()
     if explicit_name:
         return explicit_name.lstrip("$"), explicit_key or "VK_F10"
-
-    object_name = str(draw.get("object_name", "") or "").strip()
-    default_toggle = _YIHUAN_DEFAULT_DRAW_TOGGLES.get(object_name)
-    if default_toggle is not None:
-        return default_toggle
     return None
 
 
@@ -1329,14 +1735,6 @@ def _yihuan_draw_toggles(parts: list[dict[str, object]]) -> dict[str, str]:
     return toggles
 
 
-def _yihuan_uses_default_body_textures(parts: list[dict[str, object]]) -> bool:
-    for part in parts:
-        for draw in part.get("draws", []):
-            if "body" in str(draw.get("object_name", "")).lower():
-                return True
-    return False
-
-
 def _key_section_suffix(variable_name: str) -> str:
     chunks = re.split(r"[^0-9A-Za-z]+", variable_name.strip("$"))
     return "".join(chunk[:1].upper() + chunk[1:] for chunk in chunks if chunk) or "DrawToggle"
@@ -1346,8 +1744,348 @@ def _ntmi_part_resource(part: dict[str, object], role: str) -> str:
     return f"ResourcePart_{part['resource_token']}_{role}"
 
 
+def _ntmi_runtime_shapekey_resource(source_suffix: str, role: str = "") -> str:
+    suffix = f"_{role}" if role else ""
+    return f"ResourceShapekeyRuntime_{_resource_token(source_suffix)}{suffix}"
+
+
+def _ntmi_texture_slots(package: dict[str, object]) -> dict[str, dict[str, str]]:
+    runtime_contract = dict(package.get("runtime_contract", {}))
+    raw_slots = str(runtime_contract.get("texture_slots", "") or "").strip()
+    if not raw_slots:
+        return {}
+    try:
+        payload = json.loads(raw_slots)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{package.get('region_hash', 'region')}: invalid texture slot JSON") from exc
+    if not isinstance(payload, dict):
+        return {}
+
+    slots: dict[str, dict[str, str]] = {}
+    for slot, raw_binding in payload.items():
+        if slot not in {"ps-t5", "ps-t7", "ps-t8", "ps-t18"}:
+            continue
+        if not isinstance(raw_binding, dict):
+            continue
+        source_path = str(raw_binding.get("source_path", "") or "").strip()
+        hash_value = str(raw_binding.get("hash", "") or "").strip().lower()
+        extension = str(raw_binding.get("extension", "") or "").strip().lower().lstrip(".")
+        if not source_path or not hash_value:
+            continue
+        if not extension:
+            extension = Path(source_path).suffix.lower().lstrip(".") or "dds"
+        slots[slot] = {
+            "hash": hash_value,
+            "source_path": source_path,
+            "extension": extension,
+            "draw_index": str(raw_binding.get("draw_index", "") or "").strip(),
+            "ps_hash": str(raw_binding.get("ps_hash", "") or "").strip().lower(),
+            "rt_count": str(raw_binding.get("rt_count", "") or "").strip(),
+        }
+    return slots
+
+
+@lru_cache(maxsize=256)
+def _texture_file_hash(path: str) -> str:
+    digest = hashlib.sha1()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()[:8]
+
+
+def _object_used_material_indices(obj: bpy.types.Object) -> set[int]:
+    mesh = getattr(obj, "data", None)
+    if mesh is None or not hasattr(mesh, "polygons"):
+        return set()
+    return {
+        int(polygon.material_index)
+        for polygon in mesh.polygons
+        if 0 <= int(polygon.material_index) < len(obj.material_slots)
+    }
+
+
+def _image_source_path(image: bpy.types.Image | None) -> str:
+    if image is None:
+        return ""
+    filepath = str(getattr(image, "filepath", "") or getattr(image, "filepath_raw", "") or "").strip()
+    if not filepath:
+        return ""
+    try:
+        return bpy.path.abspath(filepath)
+    except Exception:  # pragma: no cover - Blender path handling differs across versions.
+        return filepath
+
+
+def _image_node_from_socket(socket, visited: set[int] | None = None):
+    if socket is None:
+        return None
+    if visited is None:
+        visited = set()
+    for link in getattr(socket, "links", []):
+        node = link.from_node
+        node_id = id(node)
+        if node_id in visited:
+            continue
+        visited.add(node_id)
+        if getattr(node, "bl_idname", "") == "ShaderNodeTexImage":
+            return node
+        for input_socket in getattr(node, "inputs", []):
+            nested = _image_node_from_socket(input_socket, visited)
+            if nested is not None:
+                return nested
+    return None
+
+
+def _material_input(material: bpy.types.Material, input_name: str):
+    if not material or not material.use_nodes or material.node_tree is None:
+        return None
+    bsdf = material.node_tree.nodes.get("Principled BSDF")
+    if bsdf is None:
+        return None
+    return bsdf.inputs.get(input_name)
+
+
+def _material_texture_paths(material: bpy.types.Material) -> dict[str, str]:
+    paths: dict[str, str] = {}
+    base_node = _image_node_from_socket(_material_input(material, "Base Color"))
+    if base_node is not None:
+        source_path = _image_source_path(getattr(base_node, "image", None))
+        if source_path:
+            paths["ps-t7"] = source_path
+
+    normal_node = _image_node_from_socket(_material_input(material, "Normal"))
+    if normal_node is not None:
+        source_path = _image_source_path(getattr(normal_node, "image", None))
+        if source_path:
+            paths["ps-t5"] = source_path
+    return paths
+
+
+def _package_material_texture_candidates(package: dict[str, object]) -> dict[str, dict[str, str]]:
+    candidates: dict[str, dict[str, str]] = {}
+    for obj in _package_draw_objects(package):
+        used_indices = _object_used_material_indices(obj)
+        for material_index in sorted(used_indices):
+            material = obj.material_slots[material_index].material
+            for slot, path in _material_texture_paths(material).items():
+                normalized_path = str(Path(path).resolve()).lower()
+                candidates.setdefault(slot, {})[normalized_path] = path
+    return candidates
+
+
+def _ntmi_effective_texture_slots(package: dict[str, object]) -> dict[str, dict[str, str]]:
+    slots = _ntmi_texture_slots(package)
+    for slot, path_by_key in _package_material_texture_candidates(package).items():
+        if len(path_by_key) != 1:
+            continue
+        source_path = next(iter(path_by_key.values()))
+        source = Path(source_path)
+        if not source.is_file():
+            continue
+
+        inherited = dict(slots.get(slot, {}))
+        old_path = str(inherited.get("source_path", "") or "")
+        if old_path and Path(old_path).resolve() == source.resolve():
+            continue
+
+        inherited.update(
+            {
+                "hash": _texture_file_hash(str(source)),
+                "source_path": str(source),
+                "extension": source.suffix.lower().lstrip(".") or "dds",
+                "source_kind": "material",
+            }
+        )
+        slots[slot] = inherited
+    return slots
+
+
+def _package_draw_objects(package: dict[str, object]) -> list[bpy.types.Object]:
+    objects: dict[str, bpy.types.Object] = {}
+    for part in package.get("parts", []):
+        for draw in part.get("draws", []):
+            object_name = str(draw.get("object_name", "") or "")
+            obj = bpy.data.objects.get(object_name)
+            if obj is not None and obj.type == "MESH":
+                objects[obj.name] = obj
+    return sorted(objects.values(), key=lambda item: item.name)
+
+
+def _copy_texture_as_is(source_path: Path, destination: Path):
+    _ensure_directory(destination.parent)
+    shutil.copy2(source_path, destination)
+
+
+def _preflight_ntmi_textures(region_packages: list[dict[str, object]]) -> list[str]:
+    warnings: list[str] = []
+    required_visible_slots = ("ps-t5", "ps-t7")
+
+    for package in region_packages:
+        region_label = _ntmi_region_resource_token(package)
+        slots = _ntmi_effective_texture_slots(package)
+        if not slots:
+            warnings.append(
+                f"{region_label}: no texture slots recorded; generated INI will not bind ps-t5/7/8/18 explicitly."
+            )
+        else:
+            for slot in required_visible_slots:
+                if slot not in slots:
+                    warnings.append(f"{region_label}: missing {slot}; material may rely on native PS bindings.")
+
+        for slot, binding in sorted(slots.items()):
+            source_path = Path(binding["source_path"])
+            if not source_path.is_file():
+                raise ValueError(f"{region_label} {slot}: texture source file is missing: {source_path}")
+            if not binding.get("draw_index") or not binding.get("ps_hash") or not binding.get("rt_count"):
+                warnings.append(
+                    f"{region_label} {slot}: texture metadata is incomplete; re-run FrameAnalysis/Profile "
+                    "before relying on material draw grouping."
+                )
+
+        for slot, path_by_key in sorted(_package_material_texture_candidates(package).items()):
+            if len(path_by_key) > 1:
+                warnings.append(
+                    f"{region_label} {slot}: multiple material textures are used in one region. "
+                    "Material draw grouping is pending, so exporter will keep the region-level texture binding for now."
+                )
+
+        for obj in _package_draw_objects(package):
+            used_indices = _object_used_material_indices(obj)
+            if len(used_indices) > 1:
+                warnings.append(
+                    f"{region_label}: object '{obj.name}' uses {len(used_indices)} material slots. "
+                    "Current exporter still emits one draw order per object; material draw grouping is pending."
+                )
+
+    # Keep UI reports readable; repeated objects can otherwise spam the same warning many times.
+    return list(dict.fromkeys(warnings))
+
+
+def _ntmi_region_resource_token(package: dict[str, object]) -> str:
+    region_hash = str(package["region_hash"])
+    index_count = package.get("original_match_index_count")
+    first_index = package.get("region_first_index")
+    if index_count is None or first_index is None:
+        return _resource_token(region_hash)
+    return _resource_token(f"{region_hash}_{int(index_count)}_{int(first_index)}")
+
+
+def _ntmi_texture_resource_name(package: dict[str, object], slot: str) -> str:
+    slot_token = slot.replace("ps-", "").replace("-", "_").upper()
+    return f"ResourceTexture_{_ntmi_region_resource_token(package)}_{slot_token}"
+
+
+def _ntmi_texture_filename(package: dict[str, object], slot: str, binding: dict[str, str]) -> str:
+    slot_token = slot.replace("ps-", "").replace("-", "_")
+    hash_value = _resource_token(binding["hash"])
+    source_path = Path(str(binding.get("source_path", "") or ""))
+    extension = str(binding.get("extension", "") or "").strip().lower().lstrip(".")
+    if not extension:
+        extension = source_path.suffix.lower().lstrip(".") or "dds"
+    extension = re.sub(r"[^0-9a-z]+", "", extension) or "dds"
+    return f"Texture/{_ntmi_region_resource_token(package)}-{slot_token}-{hash_value}.{extension}"
+
+
 def _ntmi_palette_resource(part: dict[str, object]) -> str:
     return f"ResourcePalette_{part['resource_token']}"
+
+
+def _parse_collector_key(collect_key: str) -> int:
+    match = _COLLECT_KEY_RE.fullmatch(str(collect_key or "").strip())
+    if not match:
+        raise ValueError(
+            f"Invalid NTMI collector collect key '{collect_key}'. "
+            "Expected a flat uint cb0 key like cs-cb0[1]. Re-run FrameAnalysis/Profile."
+        )
+    return int(match.group("lane"))
+
+
+def _parse_finish_condition_terms(finish_condition: str) -> dict[int, int]:
+    raw_terms = [term.strip() for term in str(finish_condition or "").split("&&") if term.strip()]
+    if len(raw_terms) < 2:
+        raise ValueError(
+            f"Invalid NTMI collector finish condition '{finish_condition}'. "
+            "Expected at least start and count guards, for example cs-cb0[1] == start && cs-cb0[3] == count."
+        )
+
+    terms: dict[int, int] = {}
+    for raw_term in raw_terms:
+        match = _COLLECT_FINISH_TERM_RE.fullmatch(raw_term)
+        if not match:
+            raise ValueError(
+                f"Invalid NTMI collector finish condition term '{raw_term}'. "
+                "Only flat uint cb0 comparisons like cs-cb0[3] == 386 are supported."
+            )
+        lane = int(match.group("lane"))
+        value = int(match.group("value"))
+        existing_value = terms.get(lane)
+        if existing_value is not None and existing_value != value:
+            raise ValueError(
+                f"Invalid NTMI collector finish condition '{finish_condition}': "
+                f"cs-cb0[{lane}] is compared to multiple values."
+            )
+        terms[lane] = value
+    return terms
+
+
+def _validate_ntmi_collector_config(collector: dict[str, str]):
+    group_slot = str(collector["group_slot"]).strip()
+    if group_slot not in {"cs-u0", "cs-u1"}:
+        raise ValueError(f"Invalid NTMI collector group slot '{group_slot}'. Expected cs-u0 or cs-u1.")
+
+    for label, key in (
+        ("collector u0 hash", "match_cs_u0_hash"),
+        ("collector u1 hash", "match_cs_u1_hash"),
+    ):
+        value = str(collector[key]).strip()
+        if not _RESOURCE_HASH_RE.fullmatch(value):
+            raise ValueError(
+                f"Invalid NTMI {label} '{value}'. Re-run FrameAnalysis/Profile with the current analyzer."
+            )
+
+    t0_hash = str(collector.get("match_cs_t0_hash", "") or "").strip()
+    if t0_hash and not _RESOURCE_HASH_RE.fullmatch(t0_hash):
+        raise ValueError(
+            f"Invalid NTMI collector t0 hash '{t0_hash}'. Re-run FrameAnalysis/Profile with the current analyzer."
+        )
+
+    collect_lane = _parse_collector_key(collector["collect_key"])
+    finish_terms = _parse_finish_condition_terms(collector["finish_condition"])
+    if collect_lane not in finish_terms:
+        raise ValueError(
+            f"Invalid NTMI collector finish condition '{collector['finish_condition']}': "
+            f"it must include the collect key lane cs-cb0[{collect_lane}]."
+        )
+
+    collect_value = finish_terms[collect_lane]
+    if not any(lane != collect_lane and value != collect_value for lane, value in finish_terms.items()):
+        raise ValueError(
+            f"Invalid NTMI collector finish condition '{collector['finish_condition']}'. "
+            "It looks like duplicated start-lane data from an old analyzer. "
+            "Re-run FrameAnalysis/Profile; the condition must include a real count/disambiguation lane."
+        )
+
+
+def _preflight_source_collector_config(collection: bpy.types.Collection):
+    def required_prop(key: str, label: str) -> str:
+        value = _optional_str_collection_prop(collection, key)
+        if not value:
+            raise ValueError(
+                f"Collection '{collection.name}' is missing NTMI collector field '{label}'. "
+                "Run Analyze Frame Resources before exporting INI."
+            )
+        return value
+
+    collector = {
+        "group_slot": required_prop(_COLLECTOR_GROUP_SLOT_PROP, "collector group slot"),
+        "match_cs_t0_hash": _optional_str_collection_prop(collection, _COLLECTOR_T0_HASH_PROP),
+        "match_cs_u0_hash": required_prop(_COLLECTOR_U0_HASH_PROP, "collector u0 hash"),
+        "match_cs_u1_hash": required_prop(_COLLECTOR_U1_HASH_PROP, "collector u1 hash"),
+        "collect_key": required_prop(_COLLECTOR_COLLECT_KEY_PROP, "collector collect key"),
+        "finish_condition": required_prop(_COLLECTOR_FINISH_CONDITION_PROP, "collector finish condition"),
+    }
+    _validate_ntmi_collector_config(collector)
 
 
 def _ntmi_collector_config(
@@ -1363,36 +2101,59 @@ def _ntmi_collector_config(
                 return value
         return default
 
-    return {
-        "group_slot": _optional_str_collection_prop(source_collection, _COLLECTOR_GROUP_SLOT_PROP)
-        or first_contract_value("collector_group_slot", _NTMI_DEFAULT_COLLECTOR_GROUP_SLOT),
-        "match_cs_t0_hash": _optional_str_collection_prop(source_collection, _COLLECTOR_T0_HASH_PROP)
-        or first_contract_value("collector_t0_hash", first_contract_value("producer_t0_hash", _NTMI_DEFAULT_COLLECTOR_T0_HASH)),
-        "match_cs_u0_hash": _optional_str_collection_prop(source_collection, _COLLECTOR_U0_HASH_PROP)
-        or first_contract_value("collector_u0_hash", _NTMI_DEFAULT_COLLECTOR_U0_HASH),
-        "match_cs_u1_hash": _optional_str_collection_prop(source_collection, _COLLECTOR_U1_HASH_PROP)
-        or first_contract_value("collector_u1_hash", _NTMI_DEFAULT_COLLECTOR_U1_HASH),
-        "collect_key": _optional_str_collection_prop(source_collection, _COLLECTOR_COLLECT_KEY_PROP)
-        or first_contract_value("collector_collect_key", _NTMI_DEFAULT_COLLECT_KEY),
-        "finish_condition": _optional_str_collection_prop(source_collection, _COLLECTOR_FINISH_CONDITION_PROP)
-        or first_contract_value("collector_finish_condition", _NTMI_DEFAULT_FINISH_CONDITION),
+    def required_value(label: str, source_key: str, contract_key: str, fallback_contract_key: str = "") -> str:
+        value = _optional_str_collection_prop(source_collection, source_key)
+        if not value:
+            value = first_contract_value(contract_key)
+        if not value and fallback_contract_key:
+            value = first_contract_value(fallback_contract_key)
+        if not value:
+            raise ValueError(
+                f"Missing NTMI collector field '{label}'. Re-run FrameAnalysis/Profile with the current analyzer "
+                "or set the corresponding collection custom property before exporting INI."
+            )
+        return value
+
+    def optional_value(source_key: str, contract_key: str, fallback_contract_key: str = "") -> str:
+        value = _optional_str_collection_prop(source_collection, source_key)
+        if not value:
+            value = first_contract_value(contract_key)
+        if not value and fallback_contract_key:
+            value = first_contract_value(fallback_contract_key)
+        return value
+
+    finish_condition = required_value(
+        "collector finish condition",
+        _COLLECTOR_FINISH_CONDITION_PROP,
+        "collector_finish_condition",
+    )
+
+    collector = {
+        "group_slot": required_value("collector group slot", _COLLECTOR_GROUP_SLOT_PROP, "collector_group_slot"),
+        "match_cs_t0_hash": optional_value(_COLLECTOR_T0_HASH_PROP, "collector_t0_hash"),
+        "match_cs_u0_hash": required_value("collector u0 hash", _COLLECTOR_U0_HASH_PROP, "collector_u0_hash"),
+        "match_cs_u1_hash": required_value("collector u1 hash", _COLLECTOR_U1_HASH_PROP, "collector_u1_hash"),
+        "collect_key": required_value("collector collect key", _COLLECTOR_COLLECT_KEY_PROP, "collector_collect_key"),
+        "finish_condition": finish_condition,
     }
+    _validate_ntmi_collector_config(collector)
+    return collector
 
 
-def _ntmi_region_match_hash(package: dict[str, object], key: str, default: str) -> str:
+def _ntmi_region_match_hash(package: dict[str, object], key: str) -> str:
     runtime_contract = dict(package.get("runtime_contract", {}))
     value = str(runtime_contract.get(key, "") or "").strip().lower()
     if value:
         return value
-    return default
+    raise ValueError(
+        f"{package.get('region_hash', 'region')}: missing NTMI draw match field '{key}'. "
+        "FrameAnalysis must provide the static resource hash used by the fast draw override."
+    )
 
 
-def _append_ntmi_texture_sections(lines: list[str], parts: list[dict[str, object]]):
-    if not _yihuan_uses_default_body_textures(parts):
-        return
-    for resource_name, filename in _YIHUAN_BODY_TEXTURE_RESOURCES:
-        lines.extend([f"[{resource_name}]", f"filename = {filename}"])
-    lines.append("")
+def _ntmi_optional_region_match_hash(package: dict[str, object], key: str) -> str:
+    runtime_contract = dict(package.get("runtime_contract", {}))
+    return str(runtime_contract.get(key, "") or "").strip().lower()
 
 
 def _append_ntmi_draw_toggle_sections(lines: list[str], parts: list[dict[str, object]], *, source_suffix: str):
@@ -1416,7 +2177,61 @@ def _append_ntmi_draw_toggle_sections(lines: list[str], parts: list[dict[str, ob
         )
 
 
-def _append_ntmi_resource_sections(lines: list[str], parts: list[dict[str, object]]):
+def _append_ntmi_texture_sections(
+    lines: list[str],
+    region_packages: list[dict[str, object]],
+    *,
+    export_root: Path,
+):
+    _ensure_directory(export_root / "Texture")
+    wrote_any = False
+    for package in region_packages:
+        for slot, binding in sorted(_ntmi_effective_texture_slots(package).items()):
+            source_path = Path(binding["source_path"])
+            if not source_path.is_file():
+                raise ValueError(
+                    f"{package['region_hash']} {slot}: texture dump file is missing: {source_path}"
+            )
+            filename = _ntmi_texture_filename(package, slot, binding)
+            destination = export_root / filename
+            _copy_texture_as_is(source_path, destination)
+            lines.extend(
+                [
+                    f"[{_ntmi_texture_resource_name(package, slot)}]",
+                    f"filename = {filename}",
+                    "",
+                ]
+            )
+            wrote_any = True
+    if wrote_any and lines and lines[-1] != "":
+        lines.append("")
+
+
+def _append_ntmi_resource_sections(lines: list[str], parts: list[dict[str, object]], *, source_suffix: str):
+    runtime_shapekey_file = ""
+    runtime_shapekey_count = 0
+    for part in parts:
+        if part.get("runtime_shapekey_file"):
+            runtime_shapekey_file = str(part["runtime_shapekey_file"])
+            runtime_shapekey_count = int(part.get("runtime_shapekey_count") or 0)
+            break
+    if runtime_shapekey_file and runtime_shapekey_count > 0:
+        lines.extend(
+            [
+                f"[{_ntmi_runtime_shapekey_resource(source_suffix, 'UAV')}]",
+                "type = RWBuffer",
+                "format = R32_FLOAT",
+                f"array = {runtime_shapekey_count}",
+                "",
+                f"[{_ntmi_runtime_shapekey_resource(source_suffix)}]",
+                "type = Buffer",
+                "format = R32_FLOAT",
+                f"array = {runtime_shapekey_count}",
+                f"filename = Buffer/{runtime_shapekey_file}",
+                "",
+            ]
+        )
+
     for part in sorted(parts, key=lambda item: str(item["resource_token"])):
         token = str(part["resource_token"])
         buffers = dict(part["buffers"])
@@ -1443,6 +2258,7 @@ def _append_ntmi_resource_sections(lines: list[str], parts: list[dict[str, objec
                 f"dynamic_slots = {dynamic_slots}",
                 "type = Buffer",
                 "format = R32_FLOAT",
+                f"array = {position_float_count}",
                 "",
                 f"[{_ntmi_part_resource(part, 'RuntimeSkinnedPositionVB')}]",
                 f"dynamic_slots = {dynamic_slots}",
@@ -1459,6 +2275,7 @@ def _append_ntmi_resource_sections(lines: list[str], parts: list[dict[str, objec
                 f"dynamic_slots = {dynamic_slots}",
                 "type = Buffer",
                 "format = R16G16B16A16_SNORM",
+                f"array = {normal_row_count}",
                 "",
                 f"[{_ntmi_part_resource(part, 'RuntimePrevSkinnedPosition')}]",
                 f"dynamic_slots = {dynamic_slots}",
@@ -1482,11 +2299,6 @@ def _append_ntmi_resource_sections(lines: list[str], parts: list[dict[str, objec
                 "stride = 12",
                 f"filename = Buffer/{buffers['vb0_pre_cs']}",
                 "",
-                f"[{_ntmi_part_resource(part, 'F33Position')}]",
-                "type = Buffer",
-                "format = R32_FLOAT",
-                f"filename = Buffer/{buffers['vb0_pre_cs']}",
-                "",
                 f"[{_ntmi_part_resource(part, 'Blend')}]",
                 "type = StructuredBuffer",
                 "stride = 8",
@@ -1496,16 +2308,6 @@ def _append_ntmi_resource_sections(lines: list[str], parts: list[dict[str, objec
                 "type = Buffer",
                 "format = R32_UINT",
                 f"filename = Buffer/{buffers['weights']}",
-                "",
-                f"[{_ntmi_part_resource(part, 'PreFrame')}]",
-                "type = StructuredBuffer",
-                "stride = 8",
-                f"filename = Buffer/{buffers['frame_pre_cs']}",
-                "",
-                f"[{_ntmi_part_resource(part, 'F33Frame')}]",
-                "type = Buffer",
-                "format = R8G8B8A8_SNORM",
-                f"filename = Buffer/{buffers['frame_pre_cs']}",
                 "",
                 f"[{_ntmi_part_resource(part, 'Normal')}]",
                 "type = Buffer",
@@ -1524,6 +2326,16 @@ def _append_ntmi_resource_sections(lines: list[str], parts: list[dict[str, objec
                 "",
             ]
         )
+        if buffers.get("shapekey_static"):
+            lines.extend(
+                [
+                    f"[{_ntmi_part_resource(part, 'ShapekeyStatic')}]",
+                    "type = Buffer",
+                    "format = R32G32B32A32_FLOAT",
+                    f"filename = Buffer/{buffers['shapekey_static']}",
+                    "",
+                ]
+            )
 
 
 def _append_ntmi_collector(
@@ -1537,68 +2349,90 @@ def _append_ntmi_collector(
     collector = _ntmi_collector_config(source_collection, region_packages)
     lines.extend(
         [
-            "; MARK: Skin dispatch. Collector builds the current group BoneAtlas, then skins custom buffers.",
+            "; MARK: Skin dispatch. Collector gathers BoneAtlas pieces, builds RuntimeGlobalT0, then runs skin.",
             f"[CollectorSkinPart_{source_suffix}]",
             f"group = {collector['group_slot']}",
-            f"match_cs_t0_hash = {collector['match_cs_t0_hash']}",
+        ]
+    )
+    if collector["match_cs_t0_hash"]:
+        lines.append(f"match_cs_t0_hash = {collector['match_cs_t0_hash']}")
+    lines.extend(
+        [
             f"match_cs_u0_hash = {collector['match_cs_u0_hash']}",
             f"match_cs_u1_hash = {collector['match_cs_u1_hash']}",
             f"collect = write, cs-t0, {collector['collect_key']}",
-            f"if {collector['finish_condition']}",
-            f"  post collect = build, {_NTMI_CORE_GLOBAL_T0_RESOURCE}",
+            "build = Resource\\NTMIv1\\RuntimeGlobalT0",
         ]
     )
     for part in sorted(parts, key=lambda item: str(item["resource_token"])):
         lines.append(
-            "  map = "
+            "map = "
             f"cs-u1:{_ntmi_part_resource(part, 'RuntimeSkinnedPosition')}, "
             f"cs-u1:{_ntmi_part_resource(part, 'RuntimeSkinnedPositionVB')}, "
             f"cs-u0:{_ntmi_part_resource(part, 'RuntimeSkinnedNormal')}"
         )
-    lines.extend(
-        [
-            f"  post run = CommandList_SkinParts_{source_suffix}",
-            "endif",
-            "",
-        ]
-    )
+    lines.append(f"run = CommandList_SkinParts_{source_suffix}")
+    lines.append("")
 
 
 def _append_ntmi_skin_commandlist(lines: list[str], *, source_suffix: str, parts: list[dict[str, object]]):
-    lines.extend([f"[CommandList_SkinParts_{source_suffix}]", f"cs-t64 = {_NTMI_CORE_GLOBAL_T0_RESOURCE}", ""])
+    lines.extend(
+        [
+            f"[CommandList_SkinParts_{source_suffix}]",
+            f"{_NTMI_SKIN_T_GLOBAL_T0} = {_NTMI_CORE_GLOBAL_T0_RESOURCE}",
+            "",
+        ]
+    )
     for part in sorted(parts, key=lambda item: str(item["resource_token"])):
+        buffers = dict(part.get("buffers", {}))
+        use_shapekey = bool(buffers.get("shapekey_static"))
         lines.extend(
             [
-                f"cs-t65 = {_ntmi_palette_resource(part)}",
+                f"{_NTMI_SKIN_T_PALETTE} = {_ntmi_palette_resource(part)}",
                 f"{_NTMI_CORE_VERTEX_COUNT} = {int(part['vertex_count'])}",
-                f"cs-t1 = {_ntmi_part_resource(part, 'BlendTyped')}",
-                f"cs-t2 = {_ntmi_part_resource(part, 'F33Frame')}",
-                f"cs-t3 = {_ntmi_part_resource(part, 'F33Position')}",
-                f"cs-u0 = {_ntmi_part_resource(part, 'RuntimeSkinnedNormal_UAV')}",
-                f"cs-u1 = {_ntmi_part_resource(part, 'RuntimeSkinnedPosition_UAV')}",
-                f"run = {_NTMI_CORE_SKIN_COMMAND}",
+                f"{_NTMI_SKIN_T_BLEND} = {_ntmi_part_resource(part, 'BlendTyped')}",
+                f"{_NTMI_SKIN_T_FRAME} = {_ntmi_part_resource(part, 'Normal')}",
+                f"{_NTMI_SKIN_T_POSITION} = {_ntmi_part_resource(part, 'Position')}",
+                f"{_NTMI_SKIN_U_NORMAL} = {_ntmi_part_resource(part, 'RuntimeSkinnedNormal_UAV')}",
+                f"{_NTMI_SKIN_U_POSITION} = {_ntmi_part_resource(part, 'RuntimeSkinnedPosition_UAV')}",
+            ]
+        )
+        if use_shapekey:
+            lines.extend(
+                [
+                    f"{_NTMI_SKIN_T_SHAPEKEY_STATIC} = {_ntmi_part_resource(part, 'ShapekeyStatic')}",
+                    f"{_NTMI_SKIN_T_SHAPEKEY_RUNTIME} = {_ntmi_runtime_shapekey_resource(source_suffix)}",
+                    f"run = {_NTMI_CORE_SKIN_SHAPEKEY_COMMAND}",
+                ]
+            )
+        else:
+            lines.append(f"run = {_NTMI_CORE_SKIN_COMMAND}")
+        lines.extend(
+            [
                 f"{_ntmi_part_resource(part, 'RuntimeSkinnedPosition')} = copy {_ntmi_part_resource(part, 'RuntimeSkinnedPosition_UAV')}",
                 f"{_ntmi_part_resource(part, 'RuntimeSkinnedPositionVB')} = copy {_ntmi_part_resource(part, 'RuntimeSkinnedPosition_UAV')}",
                 f"{_ntmi_part_resource(part, 'RuntimeSkinnedNormal')} = copy {_ntmi_part_resource(part, 'RuntimeSkinnedNormal_UAV')}",
                 "",
             ]
         )
-
-
-def _ntmi_body_texture_lines_for_draw(draw: dict[str, object]) -> list[str]:
-    if "body" not in str(draw.get("object_name", "")).lower():
-        return []
-    return [
-        "ps-t5 = ResourceT5",
-        "ps-t7 = ResourceT7",
-        "ps-t8 = ResourceT8",
-        "ps-t18 = ResourceT18",
-    ]
+    lines.extend(
+        [
+            f"{_NTMI_SKIN_T_GLOBAL_T0} = null",
+            f"{_NTMI_SKIN_T_PALETTE} = null",
+            f"{_NTMI_SKIN_T_BLEND} = null",
+            f"{_NTMI_SKIN_T_FRAME} = null",
+            f"{_NTMI_SKIN_T_POSITION} = null",
+            f"{_NTMI_SKIN_T_SHAPEKEY_STATIC} = null",
+            f"{_NTMI_SKIN_T_SHAPEKEY_RUNTIME} = null",
+            f"{_NTMI_SKIN_U_NORMAL} = null",
+            f"{_NTMI_SKIN_U_POSITION} = null",
+            "",
+        ]
+    )
 
 
 def _append_ntmi_draw_lines(lines: list[str], part: dict[str, object]):
     for draw in part["draws"]:
-        lines.extend(_ntmi_body_texture_lines_for_draw(draw))
         lines.append(f"; [mesh:{draw['object_name']}] [vertex_count:{draw['vertex_count']}]")
         draw_line = f"drawindexed = {draw['index_count']},{draw['first_index']},0"
         toggle = _draw_toggle_for_draw(draw)
@@ -1611,12 +2445,25 @@ def _append_ntmi_draw_lines(lines: list[str], part: dict[str, object]):
             lines.append("endif")
 
 
-def _append_ntmi_draw_overrides(lines: list[str], region_packages: list[dict[str, object]]):
+def _append_ntmi_texture_bindings_for_package(lines: list[str], package: dict[str, object]):
+    for slot in ("ps-t5", "ps-t7", "ps-t8", "ps-t18"):
+        if slot not in _ntmi_effective_texture_slots(package):
+            continue
+        lines.append(f"{slot} = {_ntmi_texture_resource_name(package, slot)}")
+
+
+def _append_ntmi_draw_overrides(
+    lines: list[str],
+    region_packages: list[dict[str, object]],
+    *,
+    include_runtime_skin: bool,
+):
     lines.append("; MARK: Draw replacement")
+    source_suffix = _yihuan_source_suffix(region_packages)
     for package in region_packages:
-        texcoord_hash = _ntmi_region_match_hash(package, "match_vs_texcoord_hash", _NTMI_DEFAULT_MATCH_TEXCOORD_HASH)
-        position_hash = _ntmi_region_match_hash(package, "match_vs_position_hash", _NTMI_DEFAULT_MATCH_POSITION_HASH)
-        outline_hash = _ntmi_region_match_hash(package, "match_vs_outline_hash", _NTMI_DEFAULT_MATCH_OUTLINE_HASH)
+        texcoord_hash = _ntmi_region_match_hash(package, "match_vs_texcoord_hash")
+        position_hash = _ntmi_region_match_hash(package, "match_vs_position_hash")
+        outline_hash = _ntmi_optional_region_match_hash(package, "match_vs_outline_hash")
         source_ib_hash = str(package["source_ib_hash"])
         lines.extend(
             [
@@ -1632,6 +2479,8 @@ def _append_ntmi_draw_overrides(lines: list[str], region_packages: list[dict[str
                 "handling = skip",
             ]
         )
+        if include_runtime_skin:
+            lines.append(f"collector = CollectorSkinPart_{source_suffix}, vb0")
         for part in sorted(package["parts"], key=lambda item: int(item["part_index"])):
             lines.extend(
                 [
@@ -1642,9 +2491,11 @@ def _append_ntmi_draw_overrides(lines: list[str], region_packages: list[dict[str
                     f"match = vs, {texcoord_hash}, {_ntmi_part_resource(part, 'Texcoord')}",
                     f"match = vs, {position_hash}, {_ntmi_part_resource(part, 'Position')}",
                     f"match = vs, dynamic, {_ntmi_part_resource(part, 'RuntimeSkinnedNormal')}",
-                    f"match = vs, {outline_hash}, {_ntmi_part_resource(part, 'OutlineParam')}",
                 ]
             )
+            if outline_hash:
+                lines.append(f"match = vs, {outline_hash}, {_ntmi_part_resource(part, 'OutlineParam')}")
+            _append_ntmi_texture_bindings_for_package(lines, package)
             _append_ntmi_draw_lines(lines, part)
         lines.append("")
 
@@ -1663,9 +2514,9 @@ def _write_ntmi_main_ini(
     lines: list[str] = []
     all_parts = [part for package in region_packages for part in package["parts"]]
     runtime_suffix = _yihuan_source_suffix(region_packages)
-    _append_ntmi_texture_sections(lines, all_parts)
+    _append_ntmi_texture_sections(lines, region_packages, export_root=export_root)
     _append_ntmi_draw_toggle_sections(lines, all_parts, source_suffix=runtime_suffix)
-    _append_ntmi_resource_sections(lines, all_parts)
+    _append_ntmi_resource_sections(lines, all_parts, source_suffix=runtime_suffix)
     if include_runtime_skin:
         _append_ntmi_collector(
             lines,
@@ -1675,7 +2526,7 @@ def _write_ntmi_main_ini(
             parts=all_parts,
         )
         _append_ntmi_skin_commandlist(lines, source_suffix=runtime_suffix, parts=all_parts)
-    _append_ntmi_draw_overrides(lines, region_packages)
+    _append_ntmi_draw_overrides(lines, region_packages, include_runtime_skin=include_runtime_skin)
 
     ini_path.write_text("\n".join(lines), encoding="utf-8")
     return ini_path
@@ -1688,6 +2539,11 @@ def _export_region_package(
     buffer_dir: Path,
     require_runtime_contract: bool,
     flip_uv_v: bool,
+    default_mirror_flip: bool,
+    export_runtime_shapekeys: bool,
+    runtime_shapekey_names: list[str],
+    runtime_shapekey_initial_weights: dict[str, float],
+    log=None,
 ) -> dict[str, object]:
     region_hash = _region_collection_hash(region_collection)
     region_index_count = _collection_region_index_count(region_collection)
@@ -1716,6 +2572,11 @@ def _export_region_package(
         region_index_count=region_index_count,
         region_first_index=region_first_index,
     )
+    if log is not None:
+        log(
+            f"Region {region_collection.name}: {len(part_definitions)} part(s), "
+            f"first_index={region_first_index}, index_count={region_index_count}"
+        )
 
     exported_parts = [
         _export_part_buffers(
@@ -1727,6 +2588,11 @@ def _export_region_package(
             region_runtime_contract=region_runtime_contract,
             buffer_dir=buffer_dir,
             flip_uv_v=flip_uv_v,
+            default_mirror_flip=default_mirror_flip,
+            export_runtime_shapekeys=export_runtime_shapekeys,
+            runtime_shapekey_names=runtime_shapekey_names,
+            runtime_shapekey_initial_weights=runtime_shapekey_initial_weights,
+            log=log,
         )
         for part_definition in part_definitions
     ]
@@ -1745,14 +2611,10 @@ def _export_region_package(
         region_hash=region_hash,
         region_index_count=region_index_count,
     )
-    all_draws = _draws_for_ini(exported_parts)
-    main_draw = max(all_draws, key=lambda item: (int(item["original_index_count"]), int(item["last_consumer_draw_index"])))
-    last_cs_cb0_hash = str(main_draw.get("last_cs_cb0_hash", ""))
-    last_cs_hash = str(main_draw.get("last_cs_hash", ""))
-    if require_runtime_contract and not last_cs_cb0_hash:
-        raise ValueError(
-            f"{region_hash}: cannot resolve the final CS cb0 hash. "
-            "The INI needs this hash to trigger gather/skin at the end of the original CS chain."
+    if log is not None:
+        log(
+            f"Region {region_collection.name}: done, {sum(int(part['vertex_count']) for part in exported_parts)} verts, "
+            f"{sum(int(part['index_count']) for part in exported_parts)} indices"
         )
     return {
         "profile_id": YIHUAN_PROFILE.profile_id,
@@ -1762,10 +2624,6 @@ def _export_region_package(
         "original_match_index_count": original_match_index_count,
         "match_index_source": match_index_source,
         "runtime_contract": region_runtime_contract,
-        "last_cs_hash": last_cs_hash,
-        "last_cs_cb0_hash": last_cs_cb0_hash,
-        "depth_vs_hashes": _hash_tuple(region_runtime_contract.get("depth_vs_hashes")),
-        "gbuffer_vs_hashes": _hash_tuple(region_runtime_contract.get("gbuffer_vs_hashes")),
         "shape_key_policy": _SHAPE_KEY_BAKE_POLICY,
         "parts": exported_parts,
     }
@@ -1776,53 +2634,116 @@ def export_collection_package(
     collection_name: str,
     export_dir: str,
     flip_uv_v: bool = False,
+    default_mirror_flip: bool = False,
     generate_ini: bool = True,
+    export_runtime_shapekeys: bool = False,
+    runtime_shapekey_names: str | None = None,
 ) -> dict[str, object]:
     """Export one strict sourceIB -> region -> part collection tree into runtime replacement assets."""
     collection = _get_collection(collection_name)
+    if generate_ini:
+        _preflight_source_collector_config(collection)
     export_root = _ensure_directory(Path(export_dir).resolve())
     buffer_dir = _ensure_directory(export_root / "Buffer")
+    log, flush_log = _build_export_logger()
     source_ib_hash = _source_root_hash(collection)
+    requested_runtime_shapekeys = _parse_runtime_shapekey_names(runtime_shapekey_names)
+    runtime_shapekey_order = (
+        _runtime_shapekey_order(collection, requested_runtime_shapekeys)
+        if export_runtime_shapekeys
+        else []
+    )
+    runtime_shapekey_initial_weights: dict[str, float] = {}
     region_collections = _resolve_region_collections(collection)
-    region_packages = [
-        _export_region_package(
-            region_collection=region_collection,
-            source_ib_hash=source_ib_hash,
-            buffer_dir=buffer_dir,
-            require_runtime_contract=generate_ini,
-            flip_uv_v=flip_uv_v,
-        )
-        for region_collection in region_collections
-    ]
-
+    region_packages: list[dict[str, object]] = []
+    shapekey_runtime_file = ""
+    has_runtime_shapekey_records = False
+    texture_warnings: list[str] = []
     ini_file: Path | None = None
-    if generate_ini:
-        ini_file = _write_ntmi_main_ini(
-            export_root=export_root,
-            ini_name=f"{source_ib_hash}.ini",
-            source_collection=collection,
-            region_packages=region_packages,
-            include_runtime_skin=True,
+    succeeded = False
+    try:
+        log(
+            f"Export start: collection={collection_name}, source_ib={source_ib_hash}, "
+            f"regions={len(region_collections)}, shapekeys={'on' if export_runtime_shapekeys else 'off'}"
         )
+        for region_collection in region_collections:
+            region_packages.append(
+                _export_region_package(
+                    region_collection=region_collection,
+                    source_ib_hash=source_ib_hash,
+                    buffer_dir=buffer_dir,
+                    require_runtime_contract=generate_ini,
+                    flip_uv_v=flip_uv_v,
+                    default_mirror_flip=default_mirror_flip,
+                    export_runtime_shapekeys=export_runtime_shapekeys,
+                    runtime_shapekey_names=runtime_shapekey_order,
+                    runtime_shapekey_initial_weights=runtime_shapekey_initial_weights,
+                    log=log,
+                )
+            )
 
-    total_vertices = sum(int(part["vertex_count"]) for package in region_packages for part in package["parts"])
-    total_indices = sum(int(part["index_count"]) for package in region_packages for part in package["parts"])
-    total_draws = sum(len(part["draws"]) for package in region_packages for part in package["parts"])
-    total_parts = sum(len(package["parts"]) for package in region_packages)
-    return {
-        "profile_id": YIHUAN_PROFILE.profile_id,
-        "collection_name": collection_name,
-        "region_hash": str(region_packages[0]["region_hash"]) if len(region_packages) == 1 else "",
-        "region_count": len(region_packages),
-        "source_ib_hash": source_ib_hash,
-        "original_match_index_count": int(region_packages[0]["original_match_index_count"]) if len(region_packages) == 1 else 0,
-        "vertex_count": total_vertices,
-        "triangle_count": total_indices // 3,
-        "slice_count": total_draws,
-        "draw_count": total_draws,
-        "part_count": total_parts,
-        "buffer_dir": str(buffer_dir),
-        "hlsl_dir": "",
-        "ini_path": "" if ini_file is None else str(ini_file),
-        "runtime_ini_path": "",
-    }
+        has_runtime_shapekey_records = any(
+            int(part.get("shapekey_record_count") or 0) > 0
+            for package in region_packages
+            for part in package["parts"]
+        )
+        if export_runtime_shapekeys and runtime_shapekey_order and has_runtime_shapekey_records:
+            shapekey_runtime_file = f"{source_ib_hash}-shapekey-runtime.buf"
+            log(
+                f"Write runtime shapekey table: {shapekey_runtime_file} "
+                f"({len(runtime_shapekey_order)} keys)"
+            )
+            write_f32_buffer(
+                str(buffer_dir / shapekey_runtime_file),
+                [runtime_shapekey_initial_weights.get(name, 0.0) for name in runtime_shapekey_order],
+            )
+            for package in region_packages:
+                package["runtime_shapekey_names"] = runtime_shapekey_order
+                package["runtime_shapekey_file"] = shapekey_runtime_file
+                package["runtime_shapekey_initial_weights"] = dict(runtime_shapekey_initial_weights)
+                for part in package["parts"]:
+                    part["runtime_shapekey_file"] = shapekey_runtime_file
+                    part["runtime_shapekey_count"] = len(runtime_shapekey_order)
+        texture_warnings = _preflight_ntmi_textures(region_packages) if generate_ini else []
+
+        if generate_ini:
+            log("Write INI")
+            ini_file = _write_ntmi_main_ini(
+                export_root=export_root,
+                ini_name=f"{source_ib_hash}.ini",
+                source_collection=collection,
+                region_packages=region_packages,
+                include_runtime_skin=True,
+            )
+
+        total_vertices = sum(int(part["vertex_count"]) for package in region_packages for part in package["parts"])
+        total_indices = sum(int(part["index_count"]) for package in region_packages for part in package["parts"])
+        total_draws = sum(len(part["draws"]) for package in region_packages for part in package["parts"])
+        total_parts = sum(len(package["parts"]) for package in region_packages)
+        log(
+            f"Export done: {len(region_packages)} region(s), {total_parts} part(s), "
+            f"{total_vertices} verts, {total_indices // 3} tris, {total_draws} draws"
+        )
+        result = {
+            "profile_id": YIHUAN_PROFILE.profile_id,
+            "collection_name": collection_name,
+            "region_hash": str(region_packages[0]["region_hash"]) if len(region_packages) == 1 else "",
+            "region_count": len(region_packages),
+            "source_ib_hash": source_ib_hash,
+            "original_match_index_count": int(region_packages[0]["original_match_index_count"]) if len(region_packages) == 1 else 0,
+            "vertex_count": total_vertices,
+            "triangle_count": total_indices // 3,
+            "slice_count": total_draws,
+            "draw_count": total_draws,
+            "part_count": total_parts,
+            "buffer_dir": str(buffer_dir),
+            "hlsl_dir": "",
+            "ini_path": "" if ini_file is None else str(ini_file),
+            "runtime_ini_path": "",
+            "texture_warnings": texture_warnings,
+            "runtime_shapekey_count": len(runtime_shapekey_order) if has_runtime_shapekey_records else 0,
+        }
+        succeeded = True
+        return result
+    finally:
+        flush_log(success=succeeded)

@@ -70,8 +70,8 @@
 - `match_cs_u0_hash`：确认原生 normal/frame 输出资源。
 - `match_cs_u1_hash`：确认原生 position 输出资源。
 - `collect_source`：当前为 `cs-t0`。
-- `collect_key`：当前为 `cs-cb0[1]`。
-- `finish_condition`：最后一次原生蒙皮 dispatch 的 cb0 条件，例如 `cs-cb0[1] == 12675 && cs-cb0[2] == 14431`。
+- `collect_key`：由同一 producer 输出池内所有 dispatch 共同稳定的 start lane 推出，常见为 `cs-cb0[1]`。
+- `finish_condition`：最后一次目标 producer dispatch 的 cb0 条件，例如 `cs-cb0[1] == 12675 && cs-cb0[2] == 14431`，或在 `1e2a` 这类布局里使用 `cs-cb0[1] == start && cs-cb0[3] == count`。
 - `core_global_t0_resource`：Core 提供的全局骨骼池引用。容量与 group 隔离由 Core/Collector 负责，角色 INI 不再声明或计算全局池容量。
 
 `finish_condition` 必须从 FrameAnalysis 里找到最后一次目标蒙皮 dispatch 后自动生成。它决定什么时候写：
@@ -81,13 +81,15 @@ post collect = build, <core_global_t0_resource>
 post run = CommandList_SkinParts_<source_ib_hash>
 ```
 
-CollectorConfig 不能靠 shader hash 猜。分析器应从目标可见 g-buffer draw 的 `vb0` 出发，按实际 resource 追溯 producer。通常只需要向上一层追到写出该 `vb0` 的原生 skin CS，因为游戏可能对同一模型执行多次蒙皮，但不同输出 resource 的内容并不等价。
+注意：`cs-cb0[n]` 是 flat uint 下标，不是 float4 register 下标。分析器必须从 FrameAnalysis 里的 cb0 与 dispatch 覆盖范围判断稳定 start/count lane；不要固定假设 count 一定在 `cs-cb0[2]`。
+
+CollectorConfig 不能靠 shader hash 猜。分析器应从目标可见 g-buffer draw 的 `vb0` resource identity（优先 `hash@GPUAddress`，没有地址时才退回稳定 hash）出发，按实际 resource 追溯 producer。通常只需要向上一层追到写出该 `vb0` 的原生 skin CS，因为游戏可能对同一模型执行多次蒙皮，但不同输出 resource 的内容并不等价。
 
 ### BoneMergeMap
 
 用于把 Blender 顶点组和每个 part 的 local palette 映射到运行时全局骨骼池。
 
-- `collect_key`：对应原生段的 `cs-cb0[1]`。
+- `collect_key`：对应 analyzer 推出的原生段 start lane。
 - `cs_t0_hash` 或 dump/resource 标识。
 - `bone_count`：通常等于该段 `cs-t0` 矩阵行数 / 3。
 - `global_bone_base`：按 Collector build 顺序累加得到。
@@ -137,9 +139,9 @@ CollectorConfig 不能靠 shader hash 猜。分析器应从目标可见 g-buffer
 
 DrawPassMap 的 producer 关系同样以实际 resource 为准：
 
-- 先确定目标 g-buffer/depth/velocity/outline draw 的原生 `vb0`。
-- 用 `vb0` resource 反推它来自哪一次原生 skin CS 输出。
-- 再从该 CS 链获取 CollectorConfig、finish condition 与 BoneMergeMap。
+- 先确定目标 g-buffer draw 的原生 `vb0` resource identity。
+- 用该 `vb0` identity 反推它来自哪一个原生 skin CS 输出池。
+- 再收集同一输出池内直到最终 producer 为止的 CS 链，获取 CollectorConfig、finish condition 与 BoneMergeMap。
 - 不靠 VS/PS shader hash 推断骨骼链，只把 shader/hash 用作阶段和槽位布局的辅助信息。
 
 ### TextureMap
@@ -235,16 +237,20 @@ DrawPassMap 的 producer 关系同样以实际 resource 为准：
 ## Shapekey 导出补充
 
 - 命名统一使用 `shapekey`，不再混用 morph / shape key / blendshape。
-- shapekey 运行顺序固定为：`Basis 静态网格 -> ApplyShapekeyPreSkin -> NTMI SkinFromBoundSlots -> Draw`。
+- 静态 `Position / Normal` 永远导出 Blender 当前可见结果。启用 runtime shapekey 不能让初始网格退回 Basis。
+- 每个 shapekey 可单独选择是否作为 runtime shapekey 导出；未选择的 shapekey 只烘焙进静态网格。
+- runtime shapekey 使用差值语义：`delta_weight = runtime_weight - initial_weight`。如果导出前 `Key_A.value = 0.7`，则静态网格已经包含 0.7 的结果，`ShapekeyRuntime[Key_A]` 初始也是 0.7，运行时初始增量为 0。
 - 导出 buf 只分两类逻辑数据区：
-  - `ShapekeyStatic`：每个 part 的全部 shapekey 静态数据，包括 header、delta position、delta normal/tangent/frame 所需数据。
-  - `ShapekeyRuntime`：每个 part 的运行时 shapekey 权重 buffer，可由按键、动画或额外 HLSL 改写。
+  - `ShapekeyStatic`：每个 part 的 shapekey 静态数据，包括 header、稳定 `key_index`、导出初始权重、稀疏 delta records、delta position、delta normal/tangent/frame 所需数据。
+  - `ShapekeyRuntime`：每个角色/工作集合共享的运行时 shapekey 权重 buffer，可由按键、动画或额外 HLSL 改写。
+- 当前实现中 `ShapekeyStatic` 使用 `R32G32B32A32_FLOAT`，`ShapekeyRuntime` 使用 `R32_FLOAT` 初始权重文件。动画 HLSL 后续如果写 UAV，必须在动画链路内显式 publish/copy 到可读 Buffer。
 - `ShapekeyRuntime_UAV` 和 `ShapekeyRuntime` 只允许作为同一个动态数据区的写视图/读视图，不允许再生成 default weights、per-key weight 或临时 morph buffer。
-- 导出必须保持 Blender 所见即所得：如果导出前 `Key_A.value = 0.7`，导出后的 `ShapekeyRuntime` 初始权重也必须是 `0.7`。
-- shapekey delta 必须按最终导出顶点重编号顺序写出，不能直接使用 Blender 原始顶点 index。
-- 如果 region 因 local palette 超过 256 被拆成多个 part，每个 part 单独生成自己的 `ShapekeyStatic` / `ShapekeyRuntime`，不能共享原始大模型 shapekey 索引。
+- `ShapekeyStatic` 必须按最终导出顶点重编号顺序写出，不能直接使用 Blender 原始顶点 index。
+- 如果 region 因 local palette 超过 256 被拆成多个 part，每个 part 单独生成自己的 `ShapekeyStatic`；共享 `ShapekeyRuntime` 只通过稳定 `key_index` 引用。
 - shapekey 必须同时影响 position 和 frame。只改 position 会破坏法线、轮廓线、边缘光和 g-buffer 稳定性。
 - 导出器只保留一套统一管线：同一套 part 划分、顶点重编号、profile 坐标/法线转换和游戏 frame 打包逻辑，同时服务静态 buffer 与 shapekey buffer。
+- 当前实现会尝试为每个 runtime shapekey 重新评估 mesh 来生成 frame delta；如果 loop/frame 无法稳定匹配，则 frame delta 退化为 0 并报告，position delta 仍然导出。
+- 第一版只支持拓扑一致的相对 shapekey；非 Basis relative key、驱动器或拓扑改变的修改器先烘焙进静态网格，不进入 runtime shapekey。
 
 ## 验证
 

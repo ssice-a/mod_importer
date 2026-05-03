@@ -15,6 +15,19 @@ Snorm4 = tuple[float, float, float, float]
 
 
 @dataclass(frozen=True)
+class TextureBinding:
+    """One pixel-shader texture binding observed in FrameAnalysis."""
+
+    slot: str
+    hash_value: str
+    source_path: str
+    extension: str
+    draw_index: int | None = None
+    ps_hash: str | None = None
+    rt_count: int | None = None
+
+
+@dataclass(frozen=True)
 class IndexSlice:
     """One draw-call slice parsed from a 3DMigoto IB text dump."""
 
@@ -50,6 +63,8 @@ class DispatchBatch:
     vertex_count: int
     u0_hash: str | None
     u1_hash: str | None
+    u0_identity: str | None = None
+    u1_identity: str | None = None
 
     @property
     def end_vertex(self) -> int:
@@ -97,8 +112,10 @@ class DetectedSlice:
     last_cs_hash: str | None
     last_cs_cb0_hash: str | None
     last_consumer_draw_index: int | None
-    depth_vs_hashes: tuple[str, ...]
-    gbuffer_vs_hashes: tuple[str, ...]
+    match_vs_texcoord_hash: str | None
+    match_vs_position_hash: str | None
+    match_vs_outline_hash: str | None
+    texture_slots: dict[str, TextureBinding]
 
 
 @dataclass(frozen=True)

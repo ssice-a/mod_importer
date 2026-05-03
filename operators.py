@@ -11,6 +11,7 @@ import bpy
 from .core.discovery import analyze_yihuan_frame_stages, discover_yihuan_model, resolve_yihuan_bundle_from_ib_hash
 from .core.exporter import export_collection_package
 from .core.importer import import_detected_model
+from .core.io import read_u32_buffer
 from .core.profiles import YIHUAN_PROFILE, get_profile
 
 
@@ -23,19 +24,20 @@ _REGION_HASH_PROP = "modimp_region_hash"
 _REGION_INDEX_COUNT_PROP = "modimp_region_index_count"
 _REGION_FIRST_INDEX_PROP = "modimp_region_first_index"
 _PART_INDEX_PROP = "modimp_part_index"
-_PRODUCER_DISPATCH_INDEX_PROP = "modimp_producer_dispatch_index"
-_PRODUCER_CS_HASH_PROP = "modimp_producer_cs_hash"
-_PRODUCER_T0_HASH_PROP = "modimp_producer_t0_hash"
-_LAST_CS_HASH_PROP = "modimp_last_cs_hash"
-_LAST_CS_CB0_HASH_PROP = "modimp_last_cs_cb0_hash"
-_LAST_CONSUMER_DRAW_INDEX_PROP = "modimp_last_consumer_draw_index"
-_DEPTH_VS_HASHES_PROP = "modimp_depth_vs_hashes"
-_GBUFFER_VS_HASHES_PROP = "modimp_gbuffer_vs_hashes"
+_MATCH_VS_TEXCOORD_HASH_PROP = "modimp_match_vs_texcoord_hash"
+_MATCH_VS_POSITION_HASH_PROP = "modimp_match_vs_position_hash"
+_MATCH_VS_OUTLINE_HASH_PROP = "modimp_match_vs_outline_hash"
+_TEXTURE_SLOTS_PROP = "modimp_texture_slots"
+_COLLECTOR_GROUP_SLOT_PROP = "modimp_collector_group_slot"
+_COLLECTOR_T0_HASH_PROP = "modimp_collector_t0_hash"
+_COLLECTOR_U0_HASH_PROP = "modimp_collector_u0_hash"
+_COLLECTOR_U1_HASH_PROP = "modimp_collector_u1_hash"
+_COLLECTOR_COLLECT_KEY_PROP = "modimp_collector_collect_key"
+_COLLECTOR_FINISH_CONDITION_PROP = "modimp_collector_finish_condition"
 _BMC_IB_HASH_PROP = "modimp_bmc_ib_hash"
 _BMC_MATCH_INDEX_COUNT_PROP = "modimp_bmc_match_index_count"
 _BMC_CHUNK_INDEX_PROP = "modimp_bmc_chunk_index"
 _BONE_MERGE_MAP_TEXT_PROP = "modimp_bone_merge_map_text"
-_STAGE_MAP_TEXT_PROP = "modimp_stage_map_text"
 _CS_COLLECT_MAP_TEXT_PROP = "modimp_cs_collect_map_text"
 _DRAW_PASS_MAP_TEXT_PROP = "modimp_draw_pass_map_text"
 _EXPORT_ROOT_COLLECTION_PROP = "modimp_export_root_collection"
@@ -46,10 +48,16 @@ _EXPORT_SPLIT_PARENT_PROP = "modimp_export_split_parent"
 _EXPORT_ROOT_KIND = "export_root"
 _IB_SUBPART_KIND = "ib_part"
 _REGION_RUNTIME_PROPS = (
-    _PRODUCER_CS_HASH_PROP,
-    _PRODUCER_T0_HASH_PROP,
-    _LAST_CS_HASH_PROP,
-    _LAST_CS_CB0_HASH_PROP,
+    _MATCH_VS_TEXCOORD_HASH_PROP,
+    _MATCH_VS_POSITION_HASH_PROP,
+)
+_COLLECTOR_RUNTIME_PROPS = (
+    _COLLECTOR_GROUP_SLOT_PROP,
+    _COLLECTOR_T0_HASH_PROP,
+    _COLLECTOR_U0_HASH_PROP,
+    _COLLECTOR_U1_HASH_PROP,
+    _COLLECTOR_COLLECT_KEY_PROP,
+    _COLLECTOR_FINISH_CONDITION_PROP,
 )
 
 
@@ -100,16 +108,20 @@ def _set_optional_collection_prop(collection: bpy.types.Collection, key: str, va
 
 
 def _slice_runtime_contract(detected_slice) -> dict[str, object]:
+    texture_slots = {
+        slot: {
+            "hash": binding.hash_value,
+            "source_path": binding.source_path,
+            "extension": binding.extension,
+        }
+        for slot, binding in sorted(detected_slice.texture_slots.items())
+    }
     return {
         _PROFILE_ID_PROP: YIHUAN_PROFILE.profile_id,
-        _PRODUCER_DISPATCH_INDEX_PROP: detected_slice.producer_dispatch_index,
-        _PRODUCER_CS_HASH_PROP: detected_slice.producer_cs_hash,
-        _PRODUCER_T0_HASH_PROP: detected_slice.producer_t0_hash,
-        _LAST_CS_HASH_PROP: detected_slice.last_cs_hash,
-        _LAST_CS_CB0_HASH_PROP: detected_slice.last_cs_cb0_hash,
-        _LAST_CONSUMER_DRAW_INDEX_PROP: detected_slice.last_consumer_draw_index,
-        _DEPTH_VS_HASHES_PROP: ",".join(detected_slice.depth_vs_hashes),
-        _GBUFFER_VS_HASHES_PROP: ",".join(detected_slice.gbuffer_vs_hashes),
+        _MATCH_VS_TEXCOORD_HASH_PROP: detected_slice.match_vs_texcoord_hash,
+        _MATCH_VS_POSITION_HASH_PROP: detected_slice.match_vs_position_hash,
+        _MATCH_VS_OUTLINE_HASH_PROP: detected_slice.match_vs_outline_hash,
+        _TEXTURE_SLOTS_PROP: json.dumps(texture_slots, ensure_ascii=False),
     }
 
 
@@ -117,87 +129,14 @@ def _object_runtime_contract(obj: bpy.types.Object) -> dict[str, object]:
     contract: dict[str, object] = {}
     for key in (
         _PROFILE_ID_PROP,
-        _PRODUCER_CS_HASH_PROP,
-        _PRODUCER_T0_HASH_PROP,
-        _LAST_CS_HASH_PROP,
-        _LAST_CS_CB0_HASH_PROP,
-        _DEPTH_VS_HASHES_PROP,
-        _GBUFFER_VS_HASHES_PROP,
+        _MATCH_VS_TEXCOORD_HASH_PROP,
+        _MATCH_VS_POSITION_HASH_PROP,
+        _MATCH_VS_OUTLINE_HASH_PROP,
+        _TEXTURE_SLOTS_PROP,
     ):
         value = _optional_str_prop(obj, key)
         if value:
             contract[key] = value
-    for key in (_PRODUCER_DISPATCH_INDEX_PROP, _LAST_CONSUMER_DRAW_INDEX_PROP):
-        value = _optional_int_prop(obj, key)
-        if value is not None:
-            contract[key] = value
-    return contract
-
-
-def _scene_runtime_contract(
-    scene: bpy.types.Scene,
-    *,
-    region_hash: str,
-    index_count: int | None,
-    first_index: int | None,
-) -> dict[str, object]:
-    resolved_hash = scene.modimp_resolved_display_ib_hash.strip().lower()
-    if resolved_hash != region_hash.lower():
-        return {}
-    if index_count is not None and int(scene.modimp_resolved_index_count) not in {0, int(index_count)}:
-        return {}
-    if first_index is not None and int(scene.modimp_resolved_first_index) != int(first_index):
-        return {}
-    return {
-        _PROFILE_ID_PROP: YIHUAN_PROFILE.profile_id,
-        _PRODUCER_T0_HASH_PROP: scene.modimp_producer_t0_hash.strip().lower(),
-        _LAST_CS_HASH_PROP: scene.modimp_last_cs_hash.strip().lower(),
-        _LAST_CS_CB0_HASH_PROP: scene.modimp_last_cs_cb0_hash.strip().lower(),
-    }
-
-
-def _build_frame_runtime_lookup(scene: bpy.types.Scene, source_ib_hash: str) -> dict[tuple[str, int, int], dict[str, object]]:
-    frame_dump_dir = scene.modimp_frame_dump_dir.strip() or None
-    if not frame_dump_dir:
-        return {}
-    try:
-        detected_model = discover_yihuan_model(frame_dump_dir, ib_hash=source_ib_hash)
-    except Exception:
-        return {}
-
-    lookup: dict[tuple[str, int, int], dict[str, object]] = {}
-    for detected_slice in detected_model.slices:
-        region_hash = (detected_slice.display_ib_hash or detected_slice.raw_ib_hash or "").strip().lower()
-        if not _HASH8_RE.fullmatch(region_hash):
-            continue
-        lookup[(region_hash, int(detected_slice.index_count), int(detected_slice.first_index))] = _slice_runtime_contract(
-            detected_slice
-        )
-    return lookup
-
-
-def _resolve_region_runtime_contract(
-    scene: bpy.types.Scene,
-    *,
-    frame_runtime_lookup: dict[tuple[str, int, int], dict[str, object]],
-    region_hash: str,
-    index_count: int | None,
-    first_index: int | None,
-    objects: list[bpy.types.Object],
-) -> dict[str, object]:
-    contract: dict[str, object] = {_PROFILE_ID_PROP: YIHUAN_PROFILE.profile_id}
-    for obj in objects:
-        contract.update(_object_runtime_contract(obj))
-    contract.update(
-        _scene_runtime_contract(
-            scene,
-            region_hash=region_hash,
-            index_count=index_count,
-            first_index=first_index,
-        )
-    )
-    if index_count is not None and first_index is not None:
-        contract.update(frame_runtime_lookup.get((region_hash.lower(), int(index_count), int(first_index)), {}))
     return contract
 
 
@@ -228,9 +167,6 @@ def _apply_resolved_bundle_to_scene(scene: bpy.types.Scene, resolved_bundle):
     scene.modimp_root_vb0_note = resolved_bundle.vb0_origin_trace.note
     scene.modimp_resolved_display_ib_hash = resolved_bundle.selected_slice.display_ib_hash or ""
     scene.modimp_resolved_import_variant = resolved_bundle.import_variant
-    scene.modimp_last_cs_hash = resolved_bundle.last_cs_hash or ""
-    scene.modimp_last_cs_cb0_hash = resolved_bundle.last_cs_cb0_hash or ""
-    scene.modimp_producer_t0_hash = resolved_bundle.selected_slice.producer_t0_hash or ""
     scene.modimp_resolved_first_index = int(resolved_bundle.selected_slice.first_index)
     scene.modimp_resolved_index_count = int(resolved_bundle.selected_slice.index_count)
     _apply_ib_collection_defaults(
@@ -311,9 +247,9 @@ def _find_export_root_collection(working_collection: bpy.types.Collection) -> bp
 def _copy_export_text_props(source: bpy.types.Collection, target: bpy.types.Collection):
     for key in (
         _BONE_MERGE_MAP_TEXT_PROP,
-        _STAGE_MAP_TEXT_PROP,
         _CS_COLLECT_MAP_TEXT_PROP,
         _DRAW_PASS_MAP_TEXT_PROP,
+        *_COLLECTOR_RUNTIME_PROPS,
     ):
         value = _optional_str_prop(source, key)
         if value:
@@ -615,7 +551,10 @@ def _export_root_for_scene(scene: bpy.types.Scene, *, create: bool = False) -> b
     if export_root is None and create:
         export_root = _ensure_export_root_collection(scene, working_collection, source_ib_hash)
     if export_root is None:
-        raise ValueError(f"Export logic root does not exist. Click Create Collection to create {_export_root_name(source_ib_hash)}.")
+        raise ValueError(
+            f"Export logic root does not exist. Import or analyze the source IB once to create "
+            f"{_export_root_name(source_ib_hash)}."
+        )
     _mark_export_root_collection(export_root, source_ib_hash)
     _copy_export_text_props(working_collection, export_root)
     return export_root
@@ -709,33 +648,22 @@ def _make_ib_subcollection(
 def _partition_objects_by_limits(objects: list[bpy.types.Object]) -> list[list[bpy.types.Object]]:
     buckets: list[list[bpy.types.Object]] = []
     current_bucket: list[bpy.types.Object] = []
-    current_vertices = 0
     current_bones: set[int] = set()
     for obj in sorted(objects, key=lambda item: item.name):
-        vertex_count = len(obj.data.vertices)
         object_bones = _used_numeric_vertex_group_ids(obj)
-        if vertex_count > 0xFFFF:
-            raise ValueError(
-                f"{obj.name}: has {vertex_count} vertices, exceeding one R16 IB. "
-                "Split this object manually; this pass only splits by object."
-            )
         if len(object_bones) > 0x100:
             raise ValueError(
-                f"{obj.name}: uses {len(object_bones)} bones, exceeding one uint8 palette. "
+                f"{obj.name}: uses {len(object_bones)} bones, exceeding one uint8 BLENDINDICES palette. "
                 "Split this object manually; this pass only splits by object."
             )
         merged_bones = current_bones | object_bones
-        would_exceed = current_bucket and (
-            current_vertices + vertex_count > 0xFFFF or len(merged_bones) > 0x100
-        )
+        would_exceed = current_bucket and len(merged_bones) > 0x100
         if would_exceed:
             buckets.append(current_bucket)
             current_bucket = []
-            current_vertices = 0
             current_bones = set()
             merged_bones = set(object_bones)
         current_bucket.append(obj)
-        current_vertices += vertex_count
         current_bones = merged_bones
     if current_bucket:
         buckets.append(current_bucket)
@@ -814,14 +742,46 @@ def _auto_split_export_root_by_limits(export_root: bpy.types.Collection) -> tupl
 
 
 def _build_bone_merge_map(summary: dict[str, object], detected_model) -> dict[str, object]:
-    dispatches_by_event = {
-        int(dispatch["event_index"]): dispatch
-        for dispatch in summary.get("dispatches", [])
-        if isinstance(dispatch, dict)
-    }
     global_bone_cursor = 0
     entries: list[dict[str, object]] = []
     dispatch_entries: list[dict[str, object]] = []
+    dispatch_bone_ranges: dict[int, tuple[int, int]] = {}
+
+    collector_rows = _collector_dispatch_rows(summary, detected_model)
+    # Runtime collector build order is the collect key order, not dispatch order.
+    # Duplicate keys follow collector semantics: later writes replace earlier ones.
+    rows_by_collect_key: dict[int, dict[str, object]] = {}
+    for dispatch in sorted(collector_rows, key=lambda item: int(item["event_index"])):
+        rows_by_collect_key[int(dispatch.get("start_vertex") or 0)] = dispatch
+
+    collector_build_rows = sorted(
+        rows_by_collect_key.values(),
+        key=lambda item: (
+            int(item.get("start_vertex") or 0),
+            int(item.get("event_index") or 0),
+        ),
+    )
+    for dispatch in collector_build_rows:
+        dispatch_index = int(dispatch["event_index"])
+        bone_count = _bone_count_from_t0_path(str(dispatch.get("t0_buf_path", "")))
+        if bone_count <= 0:
+            raise ValueError(f"Dispatch {dispatch_index} has no usable cs-t0 bone buffer.")
+
+        dispatch_bone_ranges[dispatch_index] = (int(global_bone_cursor), int(bone_count))
+        dispatch_entries.append(
+            {
+                "source_ib_hash": str(detected_model.ib_hash).lower(),
+                "producer_dispatch_index": int(dispatch_index),
+                "producer_start_vertex": int(dispatch.get("start_vertex") or 0),
+                "producer_vertex_count": int(dispatch.get("vertex_count") or 0),
+                "producer_cs_hash": str(dispatch.get("cs_hash", "") or "").lower(),
+                "producer_t0_hash": str(dispatch.get("t0_hash", "") or "").lower(),
+                "collect_key_value": int(dispatch.get("start_vertex") or 0),
+                "global_bone_base": int(global_bone_cursor),
+                "bone_count": int(bone_count),
+            }
+        )
+        global_bone_cursor += bone_count
 
     for detected_slice in sorted(
         detected_model.slices,
@@ -832,46 +792,17 @@ def _build_bone_merge_map(summary: dict[str, object], detected_model) -> dict[st
         ),
     ):
         dispatch_index = detected_slice.producer_dispatch_index
-        if dispatch_index is None:
-            continue
-        dispatch = dispatches_by_event.get(int(dispatch_index), {})
-        bone_count = _bone_count_from_t0_path(str(dispatch.get("t0_buf_path", "")))
-        if bone_count <= 0:
+        if dispatch_index is None or int(dispatch_index) not in dispatch_bone_ranges:
             continue
 
+        global_bone_base, bone_count = dispatch_bone_ranges[int(dispatch_index)]
         region_hash = str(detected_slice.display_ib_hash or detected_slice.raw_ib_hash or "").strip().lower()
         if not _HASH8_RE.fullmatch(region_hash):
             region_hash = str(detected_slice.raw_ib_hash or "").strip().lower()
         if not _HASH8_RE.fullmatch(region_hash):
             continue
-
-        producer_start_vertex = dispatch.get("start_vertex")
-        if producer_start_vertex is None:
-            producer_start_vertex = detected_slice.producer_start_vertex or 0
-        producer_vertex_count = dispatch.get("vertex_count")
-        if producer_vertex_count is None:
-            producer_vertex_count = detected_slice.producer_vertex_count or 0
-
-        dispatch_entry = {
-            "source_ib_hash": str(detected_model.ib_hash).lower(),
-            "region_hash": region_hash,
-            "first_index": int(detected_slice.first_index),
-            "index_count": int(detected_slice.index_count),
-            "used_vertex_start": int(detected_slice.used_vertex_start),
-            "used_vertex_end": int(detected_slice.used_vertex_end),
-            "producer_dispatch_index": int(dispatch_index),
-            "producer_start_vertex": int(producer_start_vertex or 0),
-            "producer_vertex_count": int(producer_vertex_count or 0),
-            "producer_cs_hash": str(detected_slice.producer_cs_hash or dispatch.get("cs_hash", "") or "").lower(),
-            "producer_t0_hash": str(detected_slice.producer_t0_hash or dispatch.get("t0_hash", "") or "").lower(),
-            "last_cs_hash": str(detected_slice.last_cs_hash or "").lower(),
-            "last_cs_cb0_hash": str(detected_slice.last_cs_cb0_hash or "").lower(),
-            "global_bone_base": int(global_bone_cursor),
-            "bone_count": int(bone_count),
-        }
-        dispatch_entries.append(dispatch_entry)
         for local_bone_index in range(bone_count):
-            global_bone_index = global_bone_cursor + local_bone_index
+            global_bone_index = global_bone_base + local_bone_index
             entries.append(
                 {
                     "source_ib_hash": str(detected_model.ib_hash).lower(),
@@ -883,7 +814,6 @@ def _build_bone_merge_map(summary: dict[str, object], detected_model) -> dict[st
                     "display_name": f"{region_hash}_bone_{local_bone_index:03d}",
                 }
             )
-        global_bone_cursor += bone_count
 
     return {
         "profile_id": YIHUAN_PROFILE.profile_id,
@@ -892,6 +822,200 @@ def _build_bone_merge_map(summary: dict[str, object], detected_model) -> dict[st
         "dispatches": dispatch_entries,
         "entries": entries,
     }
+
+
+def _unique_nonempty_value(rows: list[dict[str, object]], key: str, label: str, *, required: bool = True) -> str:
+    values = {
+        str(row.get(key, "") or "").strip().lower()
+        for row in rows
+        if str(row.get(key, "") or "").strip()
+    }
+    if not values:
+        if required:
+            raise ValueError(f"FrameAnalysis could not infer collector {label}.")
+        return ""
+    if len(values) > 1:
+        raise ValueError(
+            f"FrameAnalysis inferred multiple collector {label} values: {', '.join(sorted(values))}. "
+            "This source IB appears to use more than one producer resource pool; split or re-analyze the target IB."
+        )
+    return next(iter(values))
+
+
+def _optional_unique_nonempty_value(rows: list[dict[str, object]], key: str) -> str:
+    values = {
+        str(row.get(key, "") or "").strip().lower()
+        for row in rows
+        if str(row.get(key, "") or "").strip()
+    }
+    return next(iter(values)) if len(values) == 1 else ""
+
+
+def _dispatches_by_event(summary: dict[str, object]) -> dict[int, dict[str, object]]:
+    return {
+        int(dispatch["event_index"]): dispatch
+        for dispatch in summary.get("dispatches", [])
+        if isinstance(dispatch, dict)
+    }
+
+
+def _producer_dispatch_indices(detected_model) -> list[int]:
+    return sorted(
+        {
+            int(detected_slice.producer_dispatch_index)
+            for detected_slice in detected_model.slices
+            if detected_slice.producer_dispatch_index is not None
+        }
+    )
+
+
+def _collector_dispatch_rows(summary: dict[str, object], detected_model) -> list[dict[str, object]]:
+    dispatches_by_event = _dispatches_by_event(summary)
+    producer_indices = _producer_dispatch_indices(detected_model)
+    if not producer_indices:
+        return []
+
+    seed_rows = [dispatches_by_event[index] for index in producer_indices if index in dispatches_by_event]
+    if not seed_rows:
+        return []
+
+    target_u0_hash = _unique_nonempty_value(seed_rows, "u0_hash", "u0 hash")
+    target_u1_hash = _unique_nonempty_value(seed_rows, "u1_hash", "u1 hash")
+    target_u0_identity = _unique_nonempty_value(seed_rows, "u0_identity", "u0 resource identity", required=False)
+    target_u1_identity = _unique_nonempty_value(seed_rows, "u1_identity", "u1 resource identity", required=False)
+    if "@" not in target_u0_identity:
+        target_u0_identity = ""
+    if "@" not in target_u1_identity:
+        target_u1_identity = ""
+    final_event = max(producer_indices)
+
+    rows: list[dict[str, object]] = []
+    for event_index, row in sorted(dispatches_by_event.items()):
+        if event_index > final_event:
+            continue
+        if target_u0_identity:
+            if str(row.get("u0_identity", "") or "").strip().lower() != target_u0_identity:
+                continue
+        elif str(row.get("u0_hash", "") or "").strip().lower() != target_u0_hash:
+            continue
+        if target_u1_identity:
+            if str(row.get("u1_identity", "") or "").strip().lower() != target_u1_identity:
+                continue
+        elif str(row.get("u1_hash", "") or "").strip().lower() != target_u1_hash:
+            continue
+        if str(row.get("u0_hash", "") or "").strip().lower() != target_u0_hash:
+            continue
+        if str(row.get("u1_hash", "") or "").strip().lower() != target_u1_hash:
+            continue
+        if not str(row.get("cb0_buf_path", "") or "").strip():
+            continue
+        if not str(row.get("t0_buf_path", "") or "").strip():
+            continue
+        if int(row.get("vertex_count") or 0) <= 0:
+            continue
+        rows.append(row)
+
+    collected_events = {int(row["event_index"]) for row in rows}
+    missing_events = [index for index in producer_indices if index not in collected_events]
+    if missing_events:
+        raise ValueError(
+            "FrameAnalysis could not rebuild the full collector dispatch chain. Missing producer events: "
+            + ", ".join(str(index) for index in missing_events)
+        )
+    return rows
+
+
+def _cb0_values_for_dispatch(row: dict[str, object]) -> list[int]:
+    cb0_buf_path = str(row.get("cb0_buf_path", "") or "").strip()
+    if not cb0_buf_path:
+        raise ValueError(f"Dispatch {row.get('event_index', '?')} has no cb0 buffer path.")
+    cb0_values = read_u32_buffer(cb0_buf_path)
+    if len(cb0_values) < 4:
+        raise ValueError(f"Collector cb0 is too small: {cb0_buf_path}")
+    return [int(value) for value in cb0_values]
+
+
+def _matching_cb0_lanes(cb0_values: list[int], value: int) -> set[int]:
+    return {index for index, cb0_value in enumerate(cb0_values) if int(cb0_value) == int(value)}
+
+
+def _collector_start_lane(rows: list[dict[str, object]]) -> int:
+    common_lanes: set[int] | None = None
+    for row in rows:
+        start_vertex = int(row.get("start_vertex") or 0)
+        lanes = _matching_cb0_lanes(_cb0_values_for_dispatch(row), start_vertex)
+        if not lanes:
+            raise ValueError(
+                f"Dispatch {row.get('event_index', '?')} cb0 does not contain start vertex {start_vertex}."
+            )
+        common_lanes = lanes if common_lanes is None else common_lanes & lanes
+
+    if not common_lanes:
+        raise ValueError("Collector dispatches do not share a stable cb0 start lane.")
+    if 1 in common_lanes:
+        return 1
+    if 0 in common_lanes:
+        return 0
+    return min(common_lanes)
+
+
+def _collector_count_lane(row: dict[str, object], *, start_lane: int) -> int:
+    cb0_values = _cb0_values_for_dispatch(row)
+    vertex_count = int(row.get("vertex_count") or 0)
+    if vertex_count <= 0:
+        raise ValueError(f"Dispatch {row.get('event_index', '?')} has invalid vertex_count {vertex_count}.")
+
+    matching_lanes = _matching_cb0_lanes(cb0_values, vertex_count)
+    non_start_lanes = matching_lanes - {start_lane}
+    for preferred_lane in (2, 3, 4):
+        if preferred_lane in non_start_lanes:
+            return preferred_lane
+    if non_start_lanes:
+        return min(non_start_lanes)
+    if matching_lanes:
+        return min(matching_lanes)
+    raise ValueError(
+        f"Dispatch {row.get('event_index', '?')} cb0 does not contain vertex_count {vertex_count}."
+    )
+
+
+def _collector_finish_condition_from_row(row: dict[str, object], *, start_lane: int) -> str:
+    cb0_values = _cb0_values_for_dispatch(row)
+    start_vertex = int(row.get("start_vertex") or 0)
+    vertex_count = int(row.get("vertex_count") or 0)
+    if start_lane >= len(cb0_values) or cb0_values[start_lane] != start_vertex:
+        start_lane = min(_matching_cb0_lanes(cb0_values, start_vertex))
+    count_lane = _collector_count_lane(row, start_lane=start_lane)
+
+    conditions = [(start_lane, start_vertex)]
+    if count_lane != start_lane:
+        conditions.append((count_lane, vertex_count))
+    return " && ".join(f"cs-cb0[{lane}] == {value}" for lane, value in conditions)
+
+
+def _build_collector_runtime_contract(summary: dict[str, object], detected_model) -> dict[str, str]:
+    collector_rows = _collector_dispatch_rows(summary, detected_model)
+    if not collector_rows:
+        return {}
+
+    start_lane = _collector_start_lane(collector_rows)
+    final_row = max(collector_rows, key=lambda row: int(row["event_index"]))
+
+    contract = {
+        _COLLECTOR_GROUP_SLOT_PROP: "cs-u1",
+        _COLLECTOR_U0_HASH_PROP: _unique_nonempty_value(collector_rows, "u0_hash", "u0 hash"),
+        _COLLECTOR_U1_HASH_PROP: _unique_nonempty_value(collector_rows, "u1_hash", "u1 hash"),
+        _COLLECTOR_COLLECT_KEY_PROP: f"cs-cb0[{start_lane}]",
+        _COLLECTOR_FINISH_CONDITION_PROP: _collector_finish_condition_from_row(final_row, start_lane=start_lane),
+    }
+    # Some games reuse one bone input resource for every producer dispatch, while
+    # others bind distinct t0 resources per segment. A single t0 hash would be
+    # unsafe in the latter case, so only emit it when FrameAnalysis proves it is
+    # unique; u0/u1 remain the authoritative producer-pool guards.
+    t0_hash = _optional_unique_nonempty_value(collector_rows, "t0_hash")
+    if t0_hash:
+        contract[_COLLECTOR_T0_HASH_PROP] = t0_hash
+    return contract
 
 
 def _map_by_region_and_local(bone_merge_map: dict[str, object]) -> dict[tuple[str, int | None, int | None, int], int]:
@@ -905,22 +1029,110 @@ def _map_by_region_and_local(bone_merge_map: dict[str, object]) -> dict[tuple[st
         first_index = raw_entry.get("first_index")
         index_count = raw_entry.get("index_count")
         lookup[(region_hash, int(first_index), int(index_count), local_bone_index)] = global_bone_index
-        lookup[(region_hash, None, None, local_bone_index)] = global_bone_index
     return lookup
+
+
+def _bone_merge_region_tables(
+    bone_merge_map: dict[str, object],
+) -> tuple[
+    dict[tuple[str, int | None, int | None, int], int],
+    dict[tuple[str, int | None, int | None], set[int]],
+    dict[tuple[str, int | None, int | None, int], int],
+]:
+    local_lookup = _map_by_region_and_local(bone_merge_map)
+    new_globals_by_region: dict[tuple[str, int | None, int | None], set[int]] = {}
+    base_by_region: dict[tuple[str, int | None, int | None], int] = {}
+
+    for (region_hash, first_index, index_count, _local_bone), global_bone in local_lookup.items():
+        region_key = (region_hash, first_index, index_count)
+        new_globals_by_region.setdefault(region_key, set()).add(int(global_bone))
+        current_base = base_by_region.get(region_key)
+        if current_base is None or int(global_bone) < current_base:
+            base_by_region[region_key] = int(global_bone)
+
+    dispatches = [
+        dict(raw_dispatch)
+        for raw_dispatch in bone_merge_map.get("dispatches", [])
+        if isinstance(raw_dispatch, dict)
+    ]
+    dispatch_rows: list[tuple[int, int, int]] = []
+    for dispatch in dispatches:
+        try:
+            event_index = int(dispatch["producer_dispatch_index"])
+            collect_key = int(dispatch.get("collect_key_value", dispatch.get("producer_start_vertex", 0)) or 0)
+            bone_count = int(dispatch["bone_count"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if bone_count <= 0:
+            continue
+        dispatch_rows.append((event_index, collect_key, bone_count))
+
+    old_global_to_new_global: dict[int, int] = {}
+    dispatch_order_base: dict[int, int] = {}
+    cursor = 0
+    for event_index, _collect_key, bone_count in sorted(dispatch_rows, key=lambda item: item[0]):
+        dispatch_order_base[event_index] = cursor
+        cursor += bone_count
+
+    key_order_base: dict[int, int] = {}
+    cursor = 0
+    for event_index, collect_key, bone_count in sorted(dispatch_rows, key=lambda item: (item[1], item[0])):
+        key_order_base[event_index] = cursor
+        cursor += bone_count
+
+    for event_index, _collect_key, bone_count in dispatch_rows:
+        old_base = dispatch_order_base.get(event_index)
+        new_base = key_order_base.get(event_index)
+        if old_base is None or new_base is None:
+            continue
+        for local_bone in range(bone_count):
+            old_global_to_new_global[old_base + local_bone] = new_base + local_bone
+
+    old_base_by_new_base: dict[int, int] = {}
+    old_cursor = 0
+    for dispatch in sorted(dispatches, key=lambda item: int(item.get("producer_dispatch_index") or 0)):
+        try:
+            new_base = int(dispatch["global_bone_base"])
+            bone_count = int(dispatch["bone_count"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        old_base_by_new_base[new_base] = old_cursor
+        old_cursor += max(0, bone_count)
+
+    old_global_lookup: dict[tuple[str, int | None, int | None, int], int] = {}
+    for region_key, new_base in base_by_region.items():
+        old_base = old_base_by_new_base.get(new_base)
+        if old_base is None:
+            continue
+        region_hash, first_index, index_count = region_key
+        for (entry_region, entry_first, entry_count, local_bone), global_bone in local_lookup.items():
+            if (entry_region, entry_first, entry_count) != region_key:
+                continue
+            old_global_lookup[(region_hash, first_index, index_count, old_base + int(local_bone))] = int(global_bone)
+
+    for region_key, new_globals in new_globals_by_region.items():
+        region_hash, first_index, index_count = region_key
+        for old_global, new_global in old_global_to_new_global.items():
+            if new_global in new_globals:
+                old_global_lookup[(region_hash, first_index, index_count, old_global)] = new_global
+
+    return local_lookup, new_globals_by_region, old_global_lookup
 
 
 def _bone_merge_text_name_for_collection(collection: bpy.types.Collection) -> str:
     existing_name = _optional_str_prop(collection, _BONE_MERGE_MAP_TEXT_PROP)
-    if existing_name:
+    source_hash = _optional_str_prop(collection, _SOURCE_IB_HASH_PROP) or collection.name
+    safe_hash = source_hash.lower() if _HASH8_RE.fullmatch(source_hash.lower()) else "working"
+    desired_name = f"modimp_{safe_hash}_bone_merge_map.json"
+    if existing_name and existing_name != "modimp_bone_merge_map.json":
         return existing_name
-    return "modimp_bone_merge_map.json"
+    return desired_name
 
 
-def _stage_text_names_for_collection(collection: bpy.types.Collection) -> dict[str, str]:
+def _analysis_text_names_for_collection(collection: bpy.types.Collection) -> dict[str, str]:
     source_hash = _optional_str_prop(collection, _SOURCE_IB_HASH_PROP) or collection.name
     safe_hash = source_hash.lower() if _HASH8_RE.fullmatch(source_hash.lower()) else "working"
     return {
-        _STAGE_MAP_TEXT_PROP: f"modimp_{safe_hash}_stage_map.json",
         _CS_COLLECT_MAP_TEXT_PROP: f"modimp_{safe_hash}_cs_collect_map.json",
         _DRAW_PASS_MAP_TEXT_PROP: f"modimp_{safe_hash}_draw_pass_map.json",
     }
@@ -934,25 +1146,20 @@ def _write_frame_analysis_maps_to_collection(
     summary: dict[str, object],
 ) -> dict[str, object]:
     bone_merge_map = _build_bone_merge_map(summary, detected_model)
-    bone_merge_text = _write_text_json("modimp_bone_merge_map.json", bone_merge_map)
+    collector_contract = _build_collector_runtime_contract(summary, detected_model)
+    for key, value in collector_contract.items():
+        _set_optional_collection_prop(collection, key, value)
+
+    bone_merge_text = _write_text_json(_bone_merge_text_name_for_collection(collection), bone_merge_map)
     collection[_BONE_MERGE_MAP_TEXT_PROP] = bone_merge_text.name
 
-    text_names = _stage_text_names_for_collection(collection)
-    stage_text = _write_text_json(
-        text_names[_STAGE_MAP_TEXT_PROP],
-        {
-            "profile_id": YIHUAN_PROFILE.profile_id,
-            "source_ib_hash": source_ib_hash,
-            "stage_map": summary.get("stage_map", {}),
-            "stage_candidates": summary.get("stage_candidates", {}),
-            "draws": summary.get("draws", []),
-        },
-    )
+    text_names = _analysis_text_names_for_collection(collection)
     cs_text = _write_text_json(
         text_names[_CS_COLLECT_MAP_TEXT_PROP],
         {
             "profile_id": YIHUAN_PROFILE.profile_id,
             "source_ib_hash": source_ib_hash,
+            "collector": collector_contract,
             "dispatches": bone_merge_map.get("dispatches", []),
         },
     )
@@ -964,28 +1171,31 @@ def _write_frame_analysis_maps_to_collection(
             "draws": summary.get("draws", []),
         },
     )
-    collection[_STAGE_MAP_TEXT_PROP] = stage_text.name
     collection[_CS_COLLECT_MAP_TEXT_PROP] = cs_text.name
     collection[_DRAW_PASS_MAP_TEXT_PROP] = draw_text.name
     return bone_merge_map
 
 
 def _object_or_collection_region_identity(obj: bpy.types.Object) -> tuple[str, int | None, int | None]:
+    object_region_hash, object_index_count, object_first_index = _object_region_identity(obj)
+    if object_region_hash and object_index_count is not None and object_first_index is not None:
+        return object_region_hash, object_index_count, object_first_index
+
     export_collection = _find_export_collection_for_object(obj)
     if export_collection is not None:
         region_hash, index_count, first_index = _collection_region_identity(export_collection)
         if region_hash:
             return region_hash, index_count, first_index
-    return _object_region_identity(obj)
+    return object_region_hash, object_index_count, object_first_index
 
 
 def _apply_bone_merge_map_to_objects(
     objects: list[bpy.types.Object],
     bone_merge_map: dict[str, object],
     *,
-    skip_already_applied: bool = True,
+    skip_already_applied: bool = False,
 ) -> int:
-    lookup = _map_by_region_and_local(bone_merge_map)
+    lookup, new_globals_by_region, _old_global_lookup = _bone_merge_region_tables(bone_merge_map)
     if not lookup:
         raise ValueError("BoneMergeMap has no usable entries.")
 
@@ -1005,11 +1215,13 @@ def _apply_bone_merge_map_to_objects(
             local_index = int(vertex_group.name)
             global_index = lookup.get((region_hash, first_index, index_count, local_index))
             if global_index is None:
-                global_index = lookup.get((region_hash, None, None, local_index))
+                region_key = (region_hash, first_index, index_count)
+                if local_index in new_globals_by_region.get(region_key, set()):
+                    global_index = local_index
             if global_index is None:
                 raise ValueError(
                     f"{obj.name}: BoneMergeMap has no entry for "
-                    f"{region_hash} first={first_index} count={index_count} local bone {local_index}."
+                    f"{region_hash} first={first_index} count={index_count} bone/group {local_index}."
                 )
             global_name = str(int(global_index))
             if vertex_group.name != global_name:
@@ -1057,9 +1269,8 @@ class MODIMP_OT_resolve_from_ib_hash(bpy.types.Operator):
             {"INFO"},
             (
                 f"Resolved {resolved_bundle.model_name}: "
-                f"slice {resolved_bundle.selected_slice.first_index}/{resolved_bundle.selected_slice.index_count}, "
-                f"last CS {scene.modimp_last_cs_hash or 'unknown'}, "
-                f"last CB0 {scene.modimp_last_cs_cb0_hash or 'unknown'}."
+                f"slice {resolved_bundle.selected_slice.first_index}/{resolved_bundle.selected_slice.index_count}. "
+                "Run Analyze Frame Resources before exporting INI."
             ),
         )
         return {"FINISHED"}
@@ -1140,211 +1351,18 @@ class MODIMP_OT_import_resolved_model(bpy.types.Operator):
                 f"Imported {import_stats['slice_count']} slices, "
                 f"{import_stats['vertex_count']} compacted verts, "
                 f"{import_stats['triangle_count']} tris into "
-                f"{scene.modimp_collection_name.strip()}; converted {renamed_groups} vertex groups to BoneStore ids."
-            ),
-        )
-        return {"FINISHED"}
-
-
-class MODIMP_OT_create_export_collection(bpy.types.Operator):
-    """Create the export logic root and one empty submesh collection per mesh."""
-
-    bl_idname = "modimp.create_export_collection"
-    bl_label = "Create Collection"
-    bl_description = "Create the working collection plus an empty export logic root with per-submesh children"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def execute(self, context):
-        scene = context.scene
-        collection_name = _scene_collection_name(scene)
-        selected_mesh_objects = [obj for obj in context.selected_objects if obj.type == "MESH"]
-        if not collection_name:
-            try:
-                selected_source_ib_hash = _common_source_ib_hash(selected_mesh_objects) if selected_mesh_objects else ""
-            except ValueError as exc:
-                self.report({"ERROR"}, str(exc))
-                return {"CANCELLED"}
-            collection_name = (
-                scene.modimp_resolved_ib_hash.strip()
-                or selected_source_ib_hash
-                or scene.modimp_ib_hash.strip()
-            )
-            _set_scene_collection_name(scene, collection_name)
-
-        source_ib_hash = collection_name.strip().lower()
-        if not _HASH8_RE.fullmatch(source_ib_hash):
-            try:
-                selected_source_ib_hash = _common_source_ib_hash(selected_mesh_objects) if selected_mesh_objects else ""
-            except ValueError as exc:
-                self.report({"ERROR"}, str(exc))
-                return {"CANCELLED"}
-            for candidate in (
-                selected_source_ib_hash,
-                scene.modimp_resolved_ib_hash.strip().lower(),
-                scene.modimp_collection_name.strip().lower(),
-            ):
-                if _HASH8_RE.fullmatch(candidate):
-                    source_ib_hash = candidate
-                    break
-        if not _HASH8_RE.fullmatch(source_ib_hash):
-            self.report({"ERROR"}, "Collection must be a source IB hash, for example 83527398.")
-            return {"CANCELLED"}
-
-        working_collection = _ensure_scene_collection_linked(scene, source_ib_hash)
-        _set_scene_collection_name(scene, working_collection.name)
-        _mark_source_collection(working_collection, source_ib_hash)
-        export_root = _ensure_export_root_collection(scene, working_collection, source_ib_hash)
-        _copy_export_text_props(working_collection, export_root)
-
-        seed_objects = selected_mesh_objects or [obj for obj in working_collection.objects if obj.type == "MESH"]
-        created_submeshes: list[str] = []
-        for obj in sorted(seed_objects, key=lambda item: item.name):
-            submesh_collection = _ensure_export_region_collection_for_object(
-                export_root,
-                obj,
-                source_ib_hash=source_ib_hash,
-                link_object=False,
-            )
-            created_submeshes.append(submesh_collection.name)
-
-        if not seed_objects:
-            self.report(
-                {"INFO"},
-                (
-                    f"Collection '{working_collection.name}' is ready. "
-                    f"Export logic root '{export_root.name}' is ready; no mesh objects were seeded."
-                ),
-            )
-            return {"FINISHED"}
-
-        self.report(
-            {"INFO"},
-            (
-                f"Collection '{working_collection.name}' is ready. "
-                f"Export logic root '{export_root.name}' has {len(created_submeshes)} submesh collection(s). "
-                "Objects were not moved or linked into the export tree."
-            ),
-        )
-        return {"FINISHED"}
-
-
-class MODIMP_OT_create_export_part(bpy.types.Operator):
-    """Create R16-safe part collections, grouped by local/region hash."""
-
-    bl_idname = "modimp.create_export_part"
-    bl_label = "Create Part"
-    bl_description = "Create local-hash part collections under the working collection and move selected meshes into them"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def execute(self, context):
-        scene = context.scene
-        selected_mesh_objects = [obj for obj in context.selected_objects if obj.type == "MESH"]
-        try:
-            selected_source_ib_hash = _common_source_ib_hash(selected_mesh_objects) if selected_mesh_objects else ""
-        except ValueError as exc:
-            self.report({"ERROR"}, str(exc))
-            return {"CANCELLED"}
-
-        source_ib_hash = ""
-        for candidate in (
-            scene.modimp_collection_name.strip().lower(),
-            scene.modimp_resolved_ib_hash.strip().lower(),
-            selected_source_ib_hash,
-        ):
-            if _HASH8_RE.fullmatch(candidate):
-                source_ib_hash = candidate
-                break
-        if not _HASH8_RE.fullmatch(source_ib_hash):
-            self.report({"ERROR"}, "Cannot resolve source IB hash for Collection.")
-            return {"CANCELLED"}
-
-        working_collection = _ensure_scene_collection_linked(scene, source_ib_hash)
-        _set_scene_collection_name(scene, working_collection.name)
-        _mark_source_collection(working_collection, source_ib_hash)
-        export_root = _ensure_export_root_collection(scene, working_collection, source_ib_hash)
-        _copy_export_text_props(working_collection, export_root)
-        frame_runtime_lookup = _build_frame_runtime_lookup(scene, source_ib_hash)
-
-        grouped_objects: dict[tuple[str, int | None, int | None], list[bpy.types.Object]] = {}
-        if selected_mesh_objects:
-            for obj in selected_mesh_objects:
-                region_hash, index_count, first_index = _object_region_identity(obj)
-                if not region_hash:
-                    self.report({"ERROR"}, f"{obj.name}: cannot resolve local/region hash for export part.")
-                    return {"CANCELLED"}
-                grouped_objects.setdefault((region_hash, index_count, first_index), []).append(obj)
-        else:
-            target_region_hash = scene.modimp_resolved_display_ib_hash.strip().lower()
-            if not _HASH8_RE.fullmatch(target_region_hash):
-                self.report({"ERROR"}, "Select mesh objects or resolve a local/region hash before creating an empty part.")
-                return {"CANCELLED"}
-            index_count = int(scene.modimp_resolved_index_count) if scene.modimp_resolved_index_count else None
-            first_index = int(scene.modimp_resolved_first_index) if scene.modimp_resolved_first_index else None
-            grouped_objects[(target_region_hash, index_count, first_index)] = []
-
-        created_parts: list[str] = []
-        linked_count = 0
-        unlinked_count = 0
-        for (region_hash, index_count, first_index), objects in sorted(grouped_objects.items()):
-            if objects:
-                region_collection = _ensure_export_region_collection_for_object(
-                    export_root,
-                    objects[0],
-                    source_ib_hash=source_ib_hash,
-                    link_object=False,
-                )
-            else:
-                region_collection_name = _region_collection_name(region_hash, index_count, first_index)
-                region_collection = _ensure_child_collection(export_root, region_collection_name)
-            runtime_contract = _resolve_region_runtime_contract(
-                scene,
-                frame_runtime_lookup=frame_runtime_lookup,
-                region_hash=region_hash,
-                index_count=index_count,
-                first_index=first_index,
-                objects=objects,
-            )
-            _mark_region_collection(
-                region_collection,
-                source_ib_hash=source_ib_hash,
-                region_hash=region_hash,
-                index_count=index_count,
-                first_index=first_index,
-                runtime_contract=runtime_contract,
-            )
-            part_collection = _next_part_collection(
-                region_collection,
-                source_ib_hash=source_ib_hash,
-                region_hash=region_hash,
-                region_index_count=index_count,
-            )
-            created_parts.append(f"{region_hash}/{part_collection.name}")
-            for obj in objects:
-                already_in_target = obj.name in part_collection.objects.keys()
-                unlinked_count += _move_object_within_export_tree(
-                    obj,
-                    export_root=export_root,
-                    target_collection=part_collection,
-                )
-                if not already_in_target:
-                    linked_count += 1
-
-        self.report(
-            {"INFO"},
-            (
-                f"Created export parts: {', '.join(created_parts)}. "
-                f"Linked {linked_count} mesh objects, unlinked {unlinked_count} stale collection-tree links."
+                f"{scene.modimp_collection_name.strip()}; converted {renamed_groups} vertex groups to global bone ids."
             ),
         )
         return {"FINISHED"}
 
 
 class MODIMP_OT_analyze_frame_stages(bpy.types.Operator):
-    """Scan FrameAnalysis and summarize draw/dispatch stage candidates."""
+    """Scan FrameAnalysis and summarize draw/dispatch resource candidates."""
 
     bl_idname = "modimp.analyze_frame_stages"
-    bl_label = "Analyze Frame Stages"
-    bl_description = "Scan FrameAnalysis log/dumps and create a stage candidate report"
+    bl_label = "Analyze Frame Resources"
+    bl_description = "Scan FrameAnalysis log/dumps and create draw, dispatch, and BoneMergeMap reports"
     bl_options = {"REGISTER"}
 
     def execute(self, context):
@@ -1383,9 +1401,14 @@ class MODIMP_OT_analyze_frame_stages(bpy.types.Operator):
         )
         _copy_export_text_props(collection, export_root)
 
+        collector_collect_key = _optional_str_prop(collection, _COLLECTOR_COLLECT_KEY_PROP)
+        collector_finish = _optional_str_prop(collection, _COLLECTOR_FINISH_CONDITION_PROP)
+        collector_summary = ""
+        if collector_collect_key and collector_finish:
+            collector_summary = f", collector {collector_collect_key} -> {collector_finish}"
         scene.modimp_frame_analysis_summary = (
             f"IB {source_ib_hash or 'mixed'}: {draw_count} draws, {dispatch_count} dispatches, "
-            f"{len(bone_merge_map.get('entries', []))} bone map rows"
+            f"{len(bone_merge_map.get('entries', []))} bone map rows{collector_summary}"
         )
         report_text = _write_text_json("modimp_frame_analysis_report.json", summary)
         self.report(
@@ -1400,7 +1423,7 @@ class MODIMP_OT_apply_bone_merge_map_to_groups(bpy.types.Operator):
 
     bl_idname = "modimp.apply_bone_merge_map_to_groups"
     bl_label = "Apply BoneMergeMap To Groups"
-    bl_description = "Rename selected objects' numeric local vertex groups to global BoneStore ids using the current collection BoneMergeMap"
+    bl_description = "Rename selected objects' numeric local vertex groups to global bone ids using the current collection BoneMergeMap"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -1464,37 +1487,6 @@ class MODIMP_OT_restore_vertex_group_names(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class MODIMP_OT_split_export_parts(bpy.types.Operator):
-    """Create visible IB sub-collections when a part exceeds vertex or palette limits."""
-
-    bl_idname = "modimp.split_export_parts"
-    bl_label = "Split Export Parts"
-    bl_description = "Split part collections into IB sub-collections by object, respecting R16 vertex and uint8 palette limits"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def execute(self, context):
-        scene = context.scene
-        try:
-            export_root = _export_root_for_scene(scene)
-        except Exception as exc:  # pylint: disable=broad-except
-            self.report({"ERROR"}, str(exc))
-            return {"CANCELLED"}
-        try:
-            changed_parts, created_children, moved_objects = _auto_split_export_root_by_limits(export_root)
-        except Exception as exc:  # pylint: disable=broad-except
-            self.report({"ERROR"}, str(exc))
-            return {"CANCELLED"}
-
-        self.report(
-            {"INFO"},
-            (
-                f"Split {changed_parts} part collection(s), created/touched {created_children} IB sub-collections, "
-                f"moved {moved_objects} object(s)."
-            ),
-        )
-        return {"FINISHED"}
-
-
 def _sync_export_collection_metadata(context) -> tuple[int, int, list[str]]:
     scene = context.scene
     working_collection = _working_collection(scene)
@@ -1552,7 +1544,7 @@ def _sync_export_collection_metadata(context) -> tuple[int, int, list[str]]:
 
 
 class MODIMP_OT_export_collection_buffers(bpy.types.Operator):
-    """Export the working collection into game buffers and optional INI/HLSL assets."""
+    """Export the working collection into game buffers and an optional INI."""
 
     bl_idname = "modimp.export_collection_buffers"
     bl_label = "Export Buffers"
@@ -1578,7 +1570,10 @@ class MODIMP_OT_export_collection_buffers(bpy.types.Operator):
                 collection_name=export_root.name,
                 export_dir=scene.modimp_export_dir.strip(),
                 flip_uv_v=scene.modimp_flip_v,
+                default_mirror_flip=scene.modimp_mirror_flip,
                 generate_ini=scene.modimp_export_mode == "BUFFERS_AND_INI",
+                export_runtime_shapekeys=scene.modimp_export_runtime_shapekeys,
+                runtime_shapekey_names=scene.modimp_runtime_shapekey_names,
             )
         except Exception as exc:  # pylint: disable=broad-except
             self.report({"ERROR"}, str(exc))
@@ -1591,13 +1586,22 @@ class MODIMP_OT_export_collection_buffers(bpy.types.Operator):
                 f"Exported {export_stats['region_count']} regions, "
                 f"{export_stats['part_count']} parts / {export_stats['draw_count']} draws, "
                 f"{export_stats['vertex_count']} verts, "
-                f"{export_stats['triangle_count']} tris to {export_stats['buffer_dir']} "
-                f"({scene.modimp_export_mode}); auto-split {split_stats[0]} collection(s)."
+                f"{export_stats['triangle_count']} tris, "
+                f"{export_stats.get('runtime_shapekey_count', 0)} runtime shapekeys to {export_stats['buffer_dir']} "
+                f"({scene.modimp_export_mode}); auto-split {split_stats[0]} collection(s). "
+                "See console for export timings."
             ),
         )
         if missing_runtime:
             self.report(
                 {"WARNING"},
                 f"Collection export contract is incomplete on: {', '.join(missing_runtime[:4])}.",
+            )
+        texture_warnings = list(export_stats.get("texture_warnings", []))
+        if texture_warnings:
+            self.report(
+                {"WARNING"},
+                f"Texture preflight: {texture_warnings[0]}"
+                + (f" (+{len(texture_warnings) - 1} more)" if len(texture_warnings) > 1 else ""),
             )
         return {"FINISHED"}

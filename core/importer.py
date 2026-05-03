@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 
 import bpy
 
@@ -133,6 +134,78 @@ def _apply_custom_normals(mesh: bpy.types.Mesh, normals: list[tuple[float, float
     mesh.normals_split_custom_set_from_vertices(normals)
 
 
+def _texture_slots_json(resolved_bundle: ResolvedImportBundle) -> str:
+    return json.dumps(
+        {
+            slot: {
+                "hash": binding.hash_value,
+                "source_path": binding.source_path,
+                "extension": binding.extension,
+                "draw_index": binding.draw_index,
+                "ps_hash": binding.ps_hash or "",
+                "rt_count": binding.rt_count,
+            }
+            for slot, binding in sorted(resolved_bundle.selected_slice.texture_slots.items())
+        },
+        ensure_ascii=False,
+    )
+
+
+def _bsdf_input(bsdf_node, *names: str):
+    for name in names:
+        if name in bsdf_node.inputs:
+            return bsdf_node.inputs[name]
+    return None
+
+
+def _add_image_texture_node(nodes, source_path: str, label: str, *, color_space: str | None = None):
+    image = bpy.data.images.load(source_path, check_existing=True)
+    if color_space and hasattr(image, "colorspace_settings"):
+        try:
+            image.colorspace_settings.name = color_space
+        except TypeError:
+            pass
+    node = nodes.new(type="ShaderNodeTexImage")
+    node.label = label
+    node.image = image
+    return node
+
+
+def _apply_material_from_texture_slots(imported_object: bpy.types.Object, resolved_bundle: ResolvedImportBundle):
+    texture_slots = resolved_bundle.selected_slice.texture_slots
+    if not texture_slots:
+        return
+
+    material_name = f"{imported_object.name}_Material"
+    material = bpy.data.materials.new(material_name)
+    material.use_nodes = True
+    nodes = material.node_tree.nodes
+    links = material.node_tree.links
+    bsdf = nodes.get("Principled BSDF")
+    if bsdf is None:
+        imported_object.data.materials.append(material)
+        return
+
+    base_binding = texture_slots.get("ps-t7")
+    if base_binding is not None:
+        base_node = _add_image_texture_node(nodes, base_binding.source_path, "ps-t7 base color")
+        base_input = _bsdf_input(bsdf, "Base Color")
+        if base_input is not None:
+            links.new(base_node.outputs["Color"], base_input)
+
+    normal_binding = texture_slots.get("ps-t5")
+    if normal_binding is not None:
+        normal_node = _add_image_texture_node(nodes, normal_binding.source_path, "ps-t5 normal", color_space="Non-Color")
+        normal_map = nodes.new(type="ShaderNodeNormalMap")
+        normal_input = _bsdf_input(bsdf, "Normal")
+        if normal_input is not None:
+            links.new(normal_node.outputs["Color"], normal_map.inputs["Color"])
+            links.new(normal_map.outputs["Normal"], normal_input)
+
+    material["modimp_texture_slots"] = _texture_slots_json(resolved_bundle)
+    imported_object.data.materials.append(material)
+
+
 def _assign_palette_groups(
     imported_object: bpy.types.Object,
     blend_indices: list[tuple[int, int, int, int]],
@@ -159,6 +232,10 @@ def _slice_object_name(*, object_prefix: str, ib_hash: str, detected_slice) -> s
 
 def _mirror_x_vector(vector: tuple[float, float, float]) -> tuple[float, float, float]:
     return (-float(vector[0]), float(vector[1]), float(vector[2]))
+
+
+def _reverse_triangle_winding(triangle: tuple[int, int, int]) -> tuple[int, int, int]:
+    return (triangle[0], triangle[2], triangle[1])
 
 
 def _load_import_resources(resolved_bundle: ResolvedImportBundle) -> _LoadedImportResources:
@@ -279,9 +356,15 @@ def _import_single_slice(
     imported_object = bpy.data.objects.new(object_name, mesh)
     target_collection.objects.link(imported_object)
 
-    # Import is intentionally simple: positions and tangent frames are converted
-    # to Blender space, but triangle winding is kept exactly as captured.
-    mesh.from_pydata(blender_positions, [], geometry.triangles)
+    # Mirror Flip is a real X reflection, so it already flips triangle handedness.
+    # Without that mirror we must flip winding explicitly for Blender front faces.
+    # Custom normals stay in their original direction either way.
+    blender_triangles = (
+        geometry.triangles
+        if mirror_flip
+        else [_reverse_triangle_winding(triangle) for triangle in geometry.triangles]
+    )
+    mesh.from_pydata(blender_positions, [], blender_triangles)
     mesh.validate(verbose=False, clean_customdata=False)
     mesh.update()
 
@@ -335,27 +418,20 @@ def _import_single_slice(
     imported_object["modimp_used_vertex_start"] = int(resolved_bundle.selected_slice.used_vertex_start)
     imported_object["modimp_used_vertex_end"] = int(resolved_bundle.selected_slice.used_vertex_end)
     imported_object["modimp_draw_indices"] = ",".join(str(value) for value in resolved_bundle.selected_slice.draw_indices)
-    if resolved_bundle.selected_slice.last_consumer_draw_index is not None:
-        imported_object["modimp_last_consumer_draw_index"] = int(resolved_bundle.selected_slice.last_consumer_draw_index)
-    if resolved_bundle.selected_slice.depth_vs_hashes:
-        imported_object["modimp_depth_vs_hashes"] = ",".join(resolved_bundle.selected_slice.depth_vs_hashes)
-    if resolved_bundle.selected_slice.gbuffer_vs_hashes:
-        imported_object["modimp_gbuffer_vs_hashes"] = ",".join(resolved_bundle.selected_slice.gbuffer_vs_hashes)
-    if resolved_bundle.selected_slice.producer_dispatch_index is not None:
-        imported_object["modimp_producer_dispatch_index"] = int(resolved_bundle.selected_slice.producer_dispatch_index)
-    if resolved_bundle.selected_slice.producer_cs_hash is not None:
-        imported_object["modimp_producer_cs_hash"] = resolved_bundle.selected_slice.producer_cs_hash
-    if resolved_bundle.selected_slice.producer_t0_hash is not None:
-        imported_object["modimp_producer_t0_hash"] = resolved_bundle.selected_slice.producer_t0_hash
-    if resolved_bundle.last_cs_hash is not None:
-        imported_object["modimp_last_cs_hash"] = resolved_bundle.last_cs_hash
-    if resolved_bundle.last_cs_cb0_hash is not None:
-        imported_object["modimp_last_cs_cb0_hash"] = resolved_bundle.last_cs_cb0_hash
+    if resolved_bundle.selected_slice.match_vs_texcoord_hash is not None:
+        imported_object["modimp_match_vs_texcoord_hash"] = resolved_bundle.selected_slice.match_vs_texcoord_hash
+    if resolved_bundle.selected_slice.match_vs_position_hash is not None:
+        imported_object["modimp_match_vs_position_hash"] = resolved_bundle.selected_slice.match_vs_position_hash
+    if resolved_bundle.selected_slice.match_vs_outline_hash is not None:
+        imported_object["modimp_match_vs_outline_hash"] = resolved_bundle.selected_slice.match_vs_outline_hash
+    if resolved_bundle.selected_slice.texture_slots:
+        imported_object["modimp_texture_slots"] = _texture_slots_json(resolved_bundle)
     if resolved_bundle.selected_slice.vb1_layout_path is not None:
         imported_object["modimp_vb1_layout_path"] = resolved_bundle.selected_slice.vb1_layout_path
     imported_object["modimp_mirror_flip"] = bool(mirror_flip)
     imported_object["modimp_root_vb0_path"] = resolved_bundle.vb0_origin_trace.closest_rest_pose_path
     imported_object["modimp_root_vb0_note"] = resolved_bundle.vb0_origin_trace.note
+    _apply_material_from_texture_slots(imported_object, resolved_bundle)
 
     if activate_object:
         _select_imported_objects(context, [imported_object], active_object=imported_object)

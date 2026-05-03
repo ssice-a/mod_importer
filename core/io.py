@@ -311,6 +311,14 @@ def write_float3_buffer(path: str, values: list[tuple[float, float, float]]) -> 
     return _write_bytes_if_changed(path, bytes(data))
 
 
+def write_float4_buffer(path: str, values: list[tuple[float, float, float, float]]) -> str:
+    """Write a little-endian float4 buffer."""
+    data = bytearray()
+    for x_value, y_value, z_value, w_value in values:
+        data.extend(struct.pack("<4f", float(x_value), float(y_value), float(z_value), float(w_value)))
+    return _write_bytes_if_changed(path, bytes(data))
+
+
 def write_f32_buffer(path: str, values: list[float]) -> str:
     """Write a little-endian float32 buffer."""
     data = bytearray()

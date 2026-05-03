@@ -5,6 +5,10 @@ from __future__ import annotations
 import bpy
 
 
+_COLLECTOR_COLLECT_KEY_PROP = "modimp_collector_collect_key"
+_COLLECTOR_FINISH_CONDITION_PROP = "modimp_collector_finish_condition"
+
+
 class VIEW3D_PT_mod_importer(bpy.types.Panel):
     """Show the current profile workflow in the 3D View sidebar."""
 
@@ -39,26 +43,19 @@ class VIEW3D_PT_mod_importer(bpy.types.Panel):
             profile_box.label(
                 text=f"Slice: first={scene.modimp_resolved_first_index} count={scene.modimp_resolved_index_count}"
             )
-        if scene.modimp_last_cs_hash:
-            profile_box.label(text=f"Last CS Hash: {scene.modimp_last_cs_hash}")
-        if scene.modimp_last_cs_cb0_hash:
-            profile_box.label(text=f"Last CS CB0 Hash: {scene.modimp_last_cs_cb0_hash}")
-        if scene.modimp_producer_t0_hash:
-            profile_box.label(text=f"Producer T0 Hash: {scene.modimp_producer_t0_hash}")
 
-        profile_box.prop(scene, "modimp_pre_cs_vb0_path")
-        profile_box.prop(scene, "modimp_post_cs_vb0_path")
-        profile_box.prop(scene, "modimp_t5_buf_path")
-        profile_box.prop(scene, "modimp_pre_cs_weight_path")
-        profile_box.prop(scene, "modimp_pre_cs_frame_path")
-        profile_box.prop(scene, "modimp_root_vb0_path")
-        if scene.modimp_root_vb0_note:
-            profile_box.label(text=scene.modimp_root_vb0_note)
+        working_collection = bpy.data.collections.get(scene.modimp_collection_name.strip())
+        if working_collection is not None:
+            collector_key = str(working_collection.get(_COLLECTOR_COLLECT_KEY_PROP, "") or "")
+            collector_finish = str(working_collection.get(_COLLECTOR_FINISH_CONDITION_PROP, "") or "")
+            if collector_key and collector_finish:
+                profile_box.separator()
+                profile_box.label(text=f"Collector: {collector_key}")
+                profile_box.label(text=collector_finish)
 
         import_box = layout.box()
         import_box.label(text="Collection / Import", icon="IMPORT")
         import_box.prop(scene, "modimp_collection_name")
-        import_box.operator("modimp.create_export_collection", icon="OUTLINER_COLLECTION")
         import_box.prop(scene, "modimp_object_prefix")
         import_box.prop(scene, "modimp_use_pre_cs_source")
         import_box.prop(scene, "modimp_flip_v")
@@ -69,8 +66,6 @@ class VIEW3D_PT_mod_importer(bpy.types.Panel):
 
         export_box = layout.box()
         export_box.label(text="Export", icon="EXPORT")
-        export_box.operator("modimp.create_export_part", icon="GROUP")
-        export_box.operator("modimp.split_export_parts", icon="MOD_ARRAY")
 
         bone_box = export_box.box()
         bone_box.label(text="Export Bone Groups", icon="GROUP_BONE")
@@ -80,6 +75,13 @@ class VIEW3D_PT_mod_importer(bpy.types.Panel):
         outline_box = export_box.box()
         outline_box.label(text="Outline / Rim Export", icon="LIGHT")
         outline_box.label(text="Uses profile defaults, object attrs, or vertex color data")
+
+        shapekey_box = export_box.box()
+        shapekey_box.label(text="Runtime Shapekey", icon="SHAPEKEY_DATA")
+        shapekey_box.prop(scene, "modimp_export_runtime_shapekeys")
+        if scene.modimp_export_runtime_shapekeys:
+            shapekey_box.prop(scene, "modimp_runtime_shapekey_names")
+            shapekey_box.label(text="Blank means all non-muted shapekeys")
 
         export_box.prop(scene, "modimp_export_dir")
         export_box.prop(scene, "modimp_export_mode")

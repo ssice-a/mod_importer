@@ -80,9 +80,9 @@ class YihuanDataConverter(GameDataConverter):
     profile_id = "yihuan"
     _axis_signs = (-1.0, -1.0, 1.0)
     _position_scale = 0.01
-    # Keep mesh winding untouched. This title's packed frame normal needs the
-    # opposite display direction in Blender, while export converts it back.
-    _blender_display_normal_sign = -1.0
+    # Do not compensate for face winding in the tangent-frame converter. Import
+    # and export handle triangle order outside this path; custom normals stay as-is.
+    _blender_display_normal_sign = 1.0
 
     def _to_blender_display_normal(self, normal: Vec3) -> Vec3:
         sign = self._blender_display_normal_sign
