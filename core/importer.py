@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+from pathlib import Path
 
 import bpy
 
@@ -14,6 +15,7 @@ from .io import (
     read_index_slice_txt,
     read_post_cs_frame_pairs,
     read_pre_cs_frame_pairs,
+    read_u8x4_records,
     read_vb0_positions,
     read_weight_pairs,
 )
@@ -92,6 +94,25 @@ def _store_int_attribute(mesh: bpy.types.Mesh, name: str, values: list[int]):
         item.value = int(value)
 
 
+def _store_outline_param_attributes(mesh: bpy.types.Mesh, values: list[tuple[int, int, int, int]]):
+    for channel_index, channel_name in enumerate(("r", "g", "b", "a")):
+        _store_int_attribute(
+            mesh,
+            f"modimp_outline_{channel_name}",
+            [int(record[channel_index]) for record in values],
+        )
+
+    color_attributes = getattr(mesh, "color_attributes", None)
+    if color_attributes is None:
+        return
+    try:
+        attribute = color_attributes.new(name="NTMI_OutlineParam", type="BYTE_COLOR", domain="POINT")
+    except TypeError:
+        return
+    for item, value in zip(attribute.data, values):
+        item.color = tuple(max(0, min(255, int(component))) / 255.0 for component in value)
+
+
 def _store_original_vertex_ids(mesh: bpy.types.Mesh, original_vertex_ids: list[int]):
     _store_int_attribute(mesh, "orig_vertex_id", [int(value) for value in original_vertex_ids])
 
@@ -149,6 +170,19 @@ def _texture_slots_json(resolved_bundle: ResolvedImportBundle) -> str:
         },
         ensure_ascii=False,
     )
+
+
+def _resolve_outline_param_buffer(resolved_bundle: ResolvedImportBundle) -> str | None:
+    outline_hash = resolved_bundle.selected_slice.match_vs_outline_hash
+    if not outline_hash:
+        return None
+
+    frame_dir = Path(resolved_bundle.frame_dump_dir)
+    for draw_index in sorted(int(value) for value in resolved_bundle.selected_slice.draw_indices):
+        prefix = f"{draw_index:06d}-vs-t"
+        for candidate in sorted(frame_dir.glob(f"{prefix}*={outline_hash}*.buf")):
+            return str(candidate)
+    return None
 
 
 def _bsdf_input(bsdf_node, *names: str):
@@ -351,6 +385,17 @@ def _import_single_slice(
             decoded_bitangent_signs = [-sign for sign in decoded_bitangent_signs]
         compact_normals = decoded_normals
 
+    compact_outline_params = None
+    outline_param_path = _resolve_outline_param_buffer(resolved_bundle)
+    if outline_param_path is not None:
+        outline_records = read_u8x4_records(outline_param_path)
+        max_vertex_id = max(geometry.original_vertex_ids, default=-1)
+        if max_vertex_id >= len(outline_records):
+            raise ValueError(
+                f"Outline parameter buffer is shorter than the imported slice: {outline_param_path}"
+            )
+        compact_outline_params = [outline_records[vertex_id] for vertex_id in geometry.original_vertex_ids]
+
     target_collection = _ensure_collection(context.scene, collection_name)
     mesh = bpy.data.meshes.new(object_name)
     imported_object = bpy.data.objects.new(object_name, mesh)
@@ -374,6 +419,8 @@ def _import_single_slice(
 
     _apply_uv_layers(mesh, geometry.packed_uv_entries, flip_uv_v=flip_uv_v)
     _store_packed_uv_attributes(mesh, geometry.packed_uv_entries)
+    if compact_outline_params is not None:
+        _store_outline_param_attributes(mesh, compact_outline_params)
 
     if compact_normals is not None:
         _apply_custom_normals(mesh, compact_normals)

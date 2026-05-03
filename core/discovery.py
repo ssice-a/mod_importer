@@ -109,6 +109,7 @@ class _ResolvedDrawRecord:
     ps_hash: str | None
     vs_resource_labels: tuple[str, ...]
     vs_resource_hashes: dict[str, str]
+    vs_resource_extensions: dict[str, str]
     ps_resource_hashes: dict[str, str]
     ps_resource_paths: dict[str, str]
     rt_count: int
@@ -333,6 +334,14 @@ def _build_draw_records(draw_events: dict[int, _DrawEventRecord]) -> tuple[_Reso
             for hash_value in [_artifact_hash(event.resources, label)]
             if hash_value
         }
+        vs_resource_extensions = {
+            label: extension
+            for label in sorted(event.resources.keys())
+            if label.startswith("vs-t")
+            for output in [_artifact_first_output(event.resources, label, ("buf", "dds", "jpg", "png"))]
+            if output is not None
+            for _output_path, extension in [output]
+        }
         ps_resource_hashes = {
             label: hash_value
             for label in sorted(event.resources.keys())
@@ -379,6 +388,7 @@ def _build_draw_records(draw_events: dict[int, _DrawEventRecord]) -> tuple[_Reso
                 ps_hash=ps_hash,
                 vs_resource_labels=vs_resource_labels,
                 vs_resource_hashes=vs_resource_hashes,
+                vs_resource_extensions=vs_resource_extensions,
                 ps_resource_hashes=ps_resource_hashes,
                 ps_resource_paths=ps_resource_paths,
                 rt_count=_draw_rt_count(event.resources),
@@ -617,10 +627,13 @@ def _infer_reused_vs_resource_hash(
     draw_group: list[_ResolvedDrawRecord],
     *,
     labels: tuple[str, ...],
+    extension: str | None = None,
 ) -> str | None:
     grouped: dict[str, dict[str, object]] = {}
     for record in draw_group:
         for label in labels:
+            if extension is not None and record.vs_resource_extensions.get(label) != extension:
+                continue
             hash_value = _normalize_hash(record.vs_resource_hashes.get(label))
             if not hash_value:
                 continue
@@ -653,7 +666,7 @@ def _infer_static_match_hashes(
         draw_group,
         labels=("vs-t4", "vs-t6"),
     )
-    outline_hash = _infer_reused_vs_resource_hash(draw_group, labels=("vs-t6", "vs-t8"))
+    outline_hash = _infer_reused_vs_resource_hash(draw_group, labels=("vs-t6", "vs-t8"), extension="buf")
     if outline_hash == position_hash:
         outline_hash = None
     return {

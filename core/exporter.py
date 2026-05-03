@@ -231,6 +231,29 @@ def _find_point_float_attribute(mesh: bpy.types.Mesh, *names: str) -> list[float
     return None
 
 
+def _clamp_u8(value: object) -> int:
+    return max(0, min(255, int(round(float(value)))))
+
+
+def _read_outline_params(mesh: bpy.types.Mesh) -> list[tuple[int, int, int, int]] | None:
+    color_attributes = getattr(mesh, "color_attributes", None)
+    if color_attributes is not None:
+        color_attribute = color_attributes.get("NTMI_OutlineParam")
+        if color_attribute is not None and getattr(color_attribute, "domain", "") == "POINT":
+            return [
+                tuple(_clamp_u8(component * 255.0) for component in item.color[:4])
+                for item in color_attribute.data
+            ]
+
+    channels: list[list[int]] = []
+    for channel_name in ("r", "g", "b", "a"):
+        attribute = mesh.attributes.get(f"modimp_outline_{channel_name}")
+        if attribute is None:
+            return None
+        channels.append([_clamp_u8(item.value) for item in attribute.data])
+    return [tuple(record) for record in zip(*channels)]
+
+
 def _shape_key_group_weights(
     obj: bpy.types.Object,
     key_block: bpy.types.ShapeKey,
@@ -807,6 +830,10 @@ def _extract_object_payload(
     loop_frames = _prepare_loop_tangent_frames(mesh_copy, uv_layer_name=uv0_layer.name)
     if loop_frames is None:
         missing_optional_attributes.append("rebuild_tangent_frame_failed")
+    outline_param_source = _read_outline_params(mesh_copy)
+    if outline_param_source is None:
+        missing_optional_attributes.append("outline_param_defaulted")
+        outline_param_source = [(255, 255, 255, 255)] * len(mesh_copy.vertices)
     runtime_shapekey_sources: list[dict[str, object]] = []
     if export_runtime_shapekeys and runtime_shapekey_names:
         runtime_shapekey_sources, shapekey_warnings = _prepare_runtime_shapekey_sources(
@@ -914,7 +941,7 @@ def _extract_object_payload(
                     decoded_tangents.append(decoded_tangent)
                     decoded_normals.append(decoded_normal)
                     decoded_signs.append(decoded_sign)
-                    outline_params.append((255, 255, 255, 255))
+                    outline_params.append(outline_param_source[source_vertex_index])
                     vertex_shapekey_records: list[dict[str, object]] = []
                     for shapekey_source in runtime_shapekey_sources:
                         shapekey_name = str(shapekey_source["name"])
