@@ -77,6 +77,18 @@ def _scene_collection_name(scene: bpy.types.Scene) -> str:
     return scene.modimp_collection_name.strip()
 
 
+def _set_scene_export_collection_name(scene: bpy.types.Scene, collection_name: str):
+    scene.modimp_export_collection_name = collection_name.strip()
+
+
+def _scene_export_collection_name(scene: bpy.types.Scene) -> str:
+    return scene.modimp_export_collection_name.strip()
+
+
+def _export_collection_name(scene: bpy.types.Scene) -> str:
+    return _scene_export_collection_name(scene) or _scene_collection_name(scene)
+
+
 def _apply_ib_collection_defaults(scene: bpy.types.Scene, ib_hash: str, export_hash: str | None = None):
     del export_hash
     if not _scene_collection_name(scene):
@@ -175,6 +187,40 @@ def _apply_resolved_bundle_to_scene(scene: bpy.types.Scene, resolved_bundle):
         resolved_bundle.ib_hash,
         resolved_bundle.selected_slice.display_ib_hash or resolved_bundle.ib_hash,
     )
+
+
+def _load_model_workflow_from_scene(
+    scene: bpy.types.Scene,
+    *,
+    need_detected_model: bool,
+    need_summary: bool,
+    need_resolved_bundle: bool,
+):
+    frame_dump_dir = scene.modimp_frame_dump_dir.strip()
+    if not frame_dump_dir:
+        raise ValueError("Fill Frame Dump Dir first.")
+
+    analysis_ib_hash = scene.modimp_ib_hash.strip() or scene.modimp_resolved_ib_hash.strip() or None
+    resolve_ib_hash = scene.modimp_ib_hash.strip() or scene.modimp_resolved_ib_hash.strip()
+
+    detected_model = None
+    summary = None
+    resolved_bundle = None
+
+    if need_detected_model:
+        detected_model = discover_yihuan_model(frame_dump_dir, ib_hash=analysis_ib_hash)
+    if need_summary:
+        summary = analyze_yihuan_frame_stages(frame_dump_dir, ib_hash=analysis_ib_hash)
+    if need_resolved_bundle:
+        if not resolve_ib_hash:
+            raise ValueError("Fill IB Hash first.")
+        resolved_bundle = resolve_yihuan_bundle_from_ib_hash(
+            resolve_ib_hash,
+            frame_dump_dir=frame_dump_dir or None,
+            use_pre_cs_source=scene.modimp_use_pre_cs_source,
+        )
+
+    return detected_model, summary, resolved_bundle
 
 
 def _ensure_scene_collection_linked(
@@ -612,7 +658,12 @@ def _working_collection(scene: bpy.types.Scene) -> bpy.types.Collection:
 
 
 def _export_root_for_scene(scene: bpy.types.Scene, *, create: bool = False) -> bpy.types.Collection:
-    working_collection = _working_collection(scene)
+    collection_name = _export_collection_name(scene)
+    if not collection_name:
+        raise ValueError("Fill Export Collection first.")
+    working_collection = bpy.data.collections.get(collection_name)
+    if working_collection is None:
+        raise ValueError(f"Export collection does not exist: {collection_name}")
     source_ib_hash = _optional_str_prop(working_collection, _SOURCE_IB_HASH_PROP) or working_collection.name
     if not _HASH8_RE.fullmatch(source_ib_hash):
         raise ValueError("Collection must be the source IB hash, for example 83527398.")
@@ -817,19 +868,9 @@ def _build_bone_merge_map(summary: dict[str, object], detected_model) -> dict[st
     dispatch_bone_ranges: dict[int, tuple[int, int]] = {}
 
     collector_rows = _collector_dispatch_rows(summary, detected_model)
-    # Runtime collector build order is the collect key order, not dispatch order.
-    # Duplicate keys follow collector semantics: later writes replace earlier ones.
-    rows_by_collect_key: dict[int, dict[str, object]] = {}
-    for dispatch in sorted(collector_rows, key=lambda item: int(item["event_index"])):
-        rows_by_collect_key[int(dispatch.get("start_vertex") or 0)] = dispatch
-
-    collector_build_rows = sorted(
-        rows_by_collect_key.values(),
-        key=lambda item: (
-            int(item.get("start_vertex") or 0),
-            int(item.get("event_index") or 0),
-        ),
-    )
+    # Keep every matched producer dispatch. Some frames reuse the same collect key
+    # across multiple segments, and collapsing them would silently drop valid bones.
+    collector_build_rows = sorted(collector_rows, key=lambda item: int(item["event_index"]))
     for dispatch in collector_build_rows:
         dispatch_index = int(dispatch["event_index"])
         bone_count = _bone_count_from_t0_path(str(dispatch.get("t0_buf_path", "")))
@@ -1246,11 +1287,16 @@ def _write_frame_analysis_maps_to_collection(
 
 
 def _object_or_collection_region_identity(obj: bpy.types.Object) -> tuple[str, int | None, int | None]:
+    export_collection = _find_export_collection_for_object(obj)
+    if export_collection is not None:
+        region_hash, index_count, first_index = _collection_region_identity(export_collection)
+        if region_hash and index_count is not None and first_index is not None:
+            return region_hash, index_count, first_index
+
     object_region_hash, object_index_count, object_first_index = _object_region_identity(obj)
     if object_region_hash and object_index_count is not None and object_first_index is not None:
         return object_region_hash, object_index_count, object_first_index
 
-    export_collection = _find_export_collection_for_object(obj)
     if export_collection is not None:
         region_hash, index_count, first_index = _collection_region_identity(export_collection)
         if region_hash:
@@ -1279,22 +1325,27 @@ def _apply_bone_merge_map_to_objects(
 
         _record_pre_bone_merge_vertex_group_names(obj)
         object_renamed = 0
+        planned_groups: list[tuple[bpy.types.VertexGroup, str, str]] = []
         for vertex_group in list(obj.vertex_groups):
             if not vertex_group.name.isdigit():
                 continue
             local_index = int(vertex_group.name)
             global_index = lookup.get((region_hash, first_index, index_count, local_index))
             if global_index is None:
-                region_key = (region_hash, first_index, index_count)
-                if local_index in new_globals_by_region.get(region_key, set()):
-                    global_index = local_index
-            if global_index is None:
                 raise ValueError(
                     f"{obj.name}: BoneMergeMap has no entry for "
                     f"{region_hash} first={first_index} count={index_count} bone/group {local_index}."
                 )
-            global_name = str(int(global_index))
-            if vertex_group.name != global_name:
+            planned_groups.append((vertex_group, vertex_group.name, str(int(global_index))))
+
+        temp_prefix = "__modimp_bonemerge_tmp_"
+        for temp_index, (vertex_group, _local_name, _global_name) in enumerate(planned_groups):
+            vertex_group.name = f"{temp_prefix}{temp_index}"
+
+        for vertex_group, local_name, global_name in planned_groups:
+            if local_name == global_name:
+                vertex_group.name = global_name
+            else:
                 existing_group = obj.vertex_groups.get(global_name)
                 if existing_group is not None and existing_group.index != vertex_group.index:
                     _merge_vertex_group_into(obj, vertex_group, existing_group)
@@ -1325,16 +1376,14 @@ class MODIMP_OT_resolve_from_ib_hash(bpy.types.Operator):
         scene = context.scene
         _ensure_supported_profile(scene)
 
-        if not scene.modimp_ib_hash.strip():
-            self.report({"ERROR"}, "Fill IB Hash first.")
-            return {"CANCELLED"}
-
         try:
-            resolved_bundle = resolve_yihuan_bundle_from_ib_hash(
-                scene.modimp_ib_hash.strip(),
-                frame_dump_dir=scene.modimp_frame_dump_dir.strip() or None,
-                use_pre_cs_source=scene.modimp_use_pre_cs_source,
+            _, _, resolved_bundle = _load_model_workflow_from_scene(
+                scene,
+                need_detected_model=False,
+                need_summary=False,
+                need_resolved_bundle=True,
             )
+            assert resolved_bundle is not None
         except Exception as exc:  # pylint: disable=broad-except
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
@@ -1355,38 +1404,31 @@ class MODIMP_OT_import_resolved_model(bpy.types.Operator):
     """Import the resolved profile model into Blender."""
 
     bl_idname = "modimp.import_resolved_model"
-    bl_label = "Import Resolved Model"
-    bl_description = "Import all detected slices for the current IB hash"
+    bl_label = "Import"
+    bl_description = "Analyze FrameAnalysis, resolve the model slice, and import all detected slices"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         scene = context.scene
         _ensure_supported_profile(scene)
 
-        if not scene.modimp_ib_hash.strip():
-            self.report({"ERROR"}, "Fill IB Hash first.")
-            return {"CANCELLED"}
-
         try:
-            detected_model = discover_yihuan_model(
-                scene.modimp_frame_dump_dir.strip() or None,
-                ib_hash=scene.modimp_ib_hash.strip(),
+            detected_model, summary, _resolved_bundle = _load_model_workflow_from_scene(
+                scene,
+                need_detected_model=True,
+                need_summary=True,
+                need_resolved_bundle=True,
             )
-            summary = analyze_yihuan_frame_stages(
-                scene.modimp_frame_dump_dir.strip() or None,
-                ib_hash=scene.modimp_ib_hash.strip(),
-            )
-            resolved_bundle = resolve_yihuan_bundle_from_ib_hash(
-                scene.modimp_ib_hash.strip(),
-                frame_dump_dir=scene.modimp_frame_dump_dir.strip() or None,
-                use_pre_cs_source=scene.modimp_use_pre_cs_source,
-            )
+            assert detected_model is not None
+            assert summary is not None
+            assert _resolved_bundle is not None
             _apply_detected_model_to_scene(scene, detected_model)
-            _apply_resolved_bundle_to_scene(scene, resolved_bundle)
 
             object_prefix = scene.modimp_object_prefix.strip()
             collection_name = _scene_collection_name(scene) or detected_model.ib_hash
             _set_scene_collection_name(scene, collection_name)
+            if not _scene_export_collection_name(scene):
+                _set_scene_export_collection_name(scene, collection_name)
             imported_objects, import_stats = import_detected_model(
                 context,
                 detected_model=detected_model,
@@ -1406,6 +1448,7 @@ class MODIMP_OT_import_resolved_model(bpy.types.Operator):
                 detected_model=detected_model,
                 summary=summary,
             )
+            _apply_resolved_bundle_to_scene(scene, _resolved_bundle)
             renamed_groups = _apply_bone_merge_map_to_objects(imported_objects, bone_merge_map)
             export_root = _ensure_export_root_collection(scene, working_collection, detected_model.ib_hash)
             _copy_export_text_props(working_collection, export_root)
@@ -1447,14 +1490,14 @@ class MODIMP_OT_analyze_frame_stages(bpy.types.Operator):
             self.report({"ERROR"}, "Fill Frame Dump Dir first.")
             return {"CANCELLED"}
         try:
-            detected_model = discover_yihuan_model(
-                scene.modimp_frame_dump_dir.strip(),
-                ib_hash=scene.modimp_ib_hash.strip() or scene.modimp_resolved_ib_hash.strip() or None,
+            detected_model, summary, _resolved_bundle = _load_model_workflow_from_scene(
+                scene,
+                need_detected_model=True,
+                need_summary=True,
+                need_resolved_bundle=False,
             )
-            summary = analyze_yihuan_frame_stages(
-                scene.modimp_frame_dump_dir.strip(),
-                ib_hash=scene.modimp_ib_hash.strip() or scene.modimp_resolved_ib_hash.strip() or None,
-            )
+            assert detected_model is not None
+            assert summary is not None
         except Exception as exc:  # pylint: disable=broad-except
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
@@ -1509,7 +1552,12 @@ class MODIMP_OT_apply_bone_merge_map_to_groups(bpy.types.Operator):
             return {"CANCELLED"}
 
         try:
-            collection = _working_collection(scene)
+            collection_name = _export_collection_name(scene) or _scene_collection_name(scene)
+            if not collection_name:
+                raise ValueError("Fill Collection first.")
+            collection = bpy.data.collections.get(collection_name)
+            if collection is None:
+                raise ValueError(f"Collection does not exist: {collection_name}")
             bone_merge_map = _read_text_json(_bone_merge_text_name_for_collection(collection))
             if not isinstance(bone_merge_map, dict):
                 raise ValueError("BoneMergeMap text block must contain a JSON object.")
@@ -1568,7 +1616,12 @@ class MODIMP_OT_restore_vertex_group_names(bpy.types.Operator):
 
 def _sync_export_collection_metadata(context) -> tuple[int, int, list[str]]:
     scene = context.scene
-    working_collection = _working_collection(scene)
+    collection_name = _export_collection_name(scene)
+    if not collection_name:
+        raise ValueError("Fill Export Collection first or import a model first.")
+    working_collection = bpy.data.collections.get(collection_name)
+    if working_collection is None:
+        raise ValueError(f"Export collection does not exist: {collection_name}")
     source_ib_hash = _optional_str_prop(working_collection, _SOURCE_IB_HASH_PROP) or working_collection.name.lower()
     if not _HASH8_RE.fullmatch(source_ib_hash):
         raise ValueError("Fill Collection with the source IB hash, for example 83527398.")
@@ -1626,7 +1679,7 @@ class MODIMP_OT_export_collection_buffers(bpy.types.Operator):
     """Export the working collection into game buffers and an optional INI."""
 
     bl_idname = "modimp.export_collection_buffers"
-    bl_label = "Export Buffers"
+    bl_label = "Export"
     bl_description = "Export game buffers and optionally generate INI/HLSL for the working collection"
     bl_options = {"REGISTER"}
 
@@ -1634,7 +1687,7 @@ class MODIMP_OT_export_collection_buffers(bpy.types.Operator):
         scene = context.scene
         _ensure_supported_profile(scene)
 
-        if not _scene_collection_name(scene):
+        if not _export_collection_name(scene) and not _scene_collection_name(scene):
             self.report({"ERROR"}, "Fill Collection first.")
             return {"CANCELLED"}
         if not scene.modimp_export_dir.strip():

@@ -11,8 +11,12 @@ REGISTERED_PROPERTY_PATHS = (
     (bpy.types.Scene, "modimp_profile"),
     (bpy.types.Scene, "modimp_frame_dump_dir"),
     (bpy.types.Scene, "modimp_ib_hash"),
+    (bpy.types.Scene, "modimp_ui_show_import_advanced"),
+    (bpy.types.Scene, "modimp_ui_show_import_details"),
+    (bpy.types.Scene, "modimp_ui_show_export_advanced"),
     (bpy.types.Scene, "modimp_object_prefix"),
     (bpy.types.Scene, "modimp_collection_name"),
+    (bpy.types.Scene, "modimp_export_collection_name"),
     (bpy.types.Scene, "modimp_use_pre_cs_source"),
     (bpy.types.Scene, "modimp_flip_v"),
     (bpy.types.Scene, "modimp_mirror_flip"),
@@ -59,6 +63,21 @@ def register_addon_properties():
         default="",
         description="Input one raw or display IB hash and let the current profile resolve the model from log.txt",
     )
+    bpy.types.Scene.modimp_ui_show_import_advanced = bpy.props.BoolProperty(
+        name="Show Import Advanced",
+        default=False,
+        description="Expand extra import settings",
+    )
+    bpy.types.Scene.modimp_ui_show_import_details = bpy.props.BoolProperty(
+        name="Show Import Details",
+        default=False,
+        description="Expand resolved model and analysis details",
+    )
+    bpy.types.Scene.modimp_ui_show_export_advanced = bpy.props.BoolProperty(
+        name="Show Export Advanced",
+        default=False,
+        description="Expand extra export settings",
+    )
     bpy.types.Scene.modimp_object_prefix = bpy.props.StringProperty(
         name="Object Prefix",
         default="",
@@ -67,7 +86,12 @@ def register_addon_properties():
     bpy.types.Scene.modimp_collection_name = bpy.props.StringProperty(
         name="Collection",
         default="",
-        description="Single working collection used by import, assignment, split, and export; blank uses the resolved big IB hash",
+        description="Working collection created during import; blank uses the resolved IB hash",
+    )
+    bpy.types.Scene.modimp_export_collection_name = bpy.props.StringProperty(
+        name="Export Collection",
+        default="",
+        description="Collection to export from; blank falls back to the working collection",
     )
     bpy.types.Scene.modimp_use_pre_cs_source = bpy.props.BoolProperty(
         name="Use Pre-CS Source",
