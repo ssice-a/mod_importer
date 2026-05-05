@@ -1,26 +1,46 @@
-# Mod Importer
+# NTMI Mod Importer
 
-这是一个面向改版 3DMigoto NTMI fast path 的 Blender 导入导出插件。当前实现目标是生成与 `E:\yh\Mods\bohe` 示例包一致的资源结构，而不是兼容旧 `BoneStore / PoseSlot / ShaderOverride` 架构。
+NTMI Mod Importer 是一个 Blender 插件，用于配合修改版 3DMigoto / NTMI fast path 工作流，从 FrameAnalysis 导入角色模型，在 Blender 中编辑后导出游戏可用的 Buffer 与可选 INI。
 
-## 当前基准
+当前插件只面向新的 NTMI 运行链路，不再生成旧的 BoneStore、PoseSlot、ShaderRegex、`ShaderOverride + checktextureoverride = ib` 方案。
 
-- 运行时规范：`docs/ntmi_export_runtime_spec.md`
-- 插件重构计划：`docs/ntmi_plugin_refactor_plan.md`
-- 示例包：`E:\yh\Mods\bohe`
-- 公共 Core：`E:\yh\Core\NTMI`
+## 环境要求
 
-## 目标流程
+- Windows。
+- Blender 4.0 或更高版本。当前开发环境使用 Blender 5.0。
+- 支持 NTMI fast TextureOverride 与 Collector 语法的修改版 3DMigoto。
+- 游戏环境中已安装 NTMI Core，例如 `Core/NTMI`。
+- 目标角色与目标 IB 的 FrameAnalysis dump。
+- `texconv.exe` 用于 DDS 预览和转换。插件默认会查找 `assets/tools/texconv/texconv.exe`。
 
-1. 用 FrameAnalysis/Profile 分析目标角色，生成 draw region、Collector、VS/PS 资源槽位、BoneMergeMap。
-2. 在 Blender 中使用单一工作集合承载导出语义；外部插件导入的模型也先放进这个集合。
-3. 顶点组可直接使用全局骨骼编号；需要时用 BoneMergeMap 工具批量转换。
-4. 导出每个 part 的 IB、position、blend、normal/frame、texcoord、outline、palette。
-5. 可选生成 NTMI fast path INI：Collector + `CommandList_SkinParts_*` + DrawIndexed fast TextureOverride。
+## 快速开始
 
-## 关键约束
+1. 在 Blender 中启用插件。
+2. 打开 `View3D > Sidebar > Mod Importer`。
+3. 选择 FrameAnalysis 文件夹。
+4. 输入目标 IB Hash。
+5. 点击 `Analyze`。
+6. 如有需要，在贴图标记面板中标记基础色、法线、材质或特效贴图。
+7. 点击 `Import` 导入模型。
+8. 在 Blender 中编辑模型。
+9. 选择导出目录。
+10. 点击 `Export`。
 
-- 性能第一：不生成全局 ShaderRegex，不生成 `ShaderOverride + checktextureoverride = ib`。
-- 可复用第二：蒙皮只调用 `E:\yh\Core\NTMI`，插件不再复制角色专属 HLSL。
-- 整洁第三：不保留旧包兼容路径；旧逻辑该删就删。
-- IB 根据最大索引自动选择 `R16_UINT` 或 `R32_UINT`。
-- 单个导出 part 的 local palette 仍不能超过 256。
+导出模式：
+
+- `Buffers Only`：只导出游戏 Buffer 与贴图。
+- `Buffers + INI`：导出 Buffer、贴图和 NTMI fast-path INI。
+
+## 文档
+
+- [INI 语法](docs/ini_syntax.md)：Collector、dynamic resource、match、draw 与 palette 规则。
+- [插件流程](docs/plugin_workflow.md)：Analyze、Import、编辑、导出流程。
+- [贴图标记](docs/texture_marking.md)：贴图候选、DDS 预览、材质节点与导出规则。
+- [常见问题](docs/troubleshooting.md)：导入、贴图、骨骼、INI 与游戏内问题排查。
+
+## 设计原则
+
+- 性能第一：不生成大范围 VS check，不生成旧 ShaderRegex fallback，不把可离线分析的事情放到运行时。
+- 复用第二：蒙皮逻辑调用 NTMI Core，插件不再为每个角色复制专属 HLSL。
+- 整洁第三：旧逻辑直接删除，不为兼容旧包保留独立路径。
+
