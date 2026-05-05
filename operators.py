@@ -748,28 +748,6 @@ def _merge_blender_duplicate_numeric_vertex_groups(obj: bpy.types.Object) -> int
     return merged_count
 
 
-def _positive_weight_group_indices(obj: bpy.types.Object) -> set[int]:
-    used: set[int] = set()
-    for vertex in obj.data.vertices:
-        for group_ref in vertex.groups:
-            if float(group_ref.weight) > 0.0:
-                used.add(int(group_ref.group))
-    return used
-
-
-def _remove_empty_numeric_vertex_groups(obj: bpy.types.Object) -> int:
-    used_indices = _positive_weight_group_indices(obj)
-    removed_count = 0
-    for vertex_group in list(obj.vertex_groups):
-        if not vertex_group.name.isdigit():
-            continue
-        if int(vertex_group.index) in used_indices:
-            continue
-        obj.vertex_groups.remove(vertex_group)
-        removed_count += 1
-    return removed_count
-
-
 def _numeric_vertex_group_summary(obj: bpy.types.Object) -> tuple[list[int], list[int], int, int]:
     numeric_groups = sorted(
         {
@@ -786,7 +764,7 @@ def _numeric_vertex_group_summary(obj: bpy.types.Object) -> tuple[list[int], lis
     return numeric_groups, missing, min_group, max_group
 
 
-def _sort_export_vertex_groups_by_name(context: bpy.types.Context, export_root: bpy.types.Collection) -> tuple[int, int, int, list[str]]:
+def _sort_export_vertex_groups_by_name(context: bpy.types.Context, export_root: bpy.types.Collection) -> tuple[int, list[str]]:
     objects: dict[str, bpy.types.Object] = {}
     for collection in _iter_collection_tree(export_root):
         for obj in collection.objects:
@@ -796,12 +774,8 @@ def _sort_export_vertex_groups_by_name(context: bpy.types.Context, export_root: 
 
     sorted_objects = sorted(objects.values(), key=lambda obj: obj.name)
     sorted_count = 0
-    repaired_count = 0
-    removed_empty_count = 0
     warnings: list[str] = []
     for obj in sorted_objects:
-        repaired_count += _merge_blender_duplicate_numeric_vertex_groups(obj)
-        removed_empty_count += _remove_empty_numeric_vertex_groups(obj)
         if len(obj.vertex_groups) < 2:
             continue
         try:
@@ -815,7 +789,7 @@ def _sort_export_vertex_groups_by_name(context: bpy.types.Context, export_root: 
             sorted_count += 1
         except Exception as exc:  # pylint: disable=broad-except
             warnings.append(f"{obj.name}: vertex group sort skipped ({exc})")
-    return sorted_count, repaired_count, removed_empty_count, warnings
+    return sorted_count, warnings
 
 
 def _object_source_ib_hash(obj: bpy.types.Object) -> str:
@@ -2260,12 +2234,7 @@ class MODIMP_OT_export_collection_buffers(bpy.types.Operator):
             export_root = _export_root_for_scene(scene)
             split_stats = _auto_split_export_root_by_limits(export_root)
             region_count, part_count, missing_runtime = _sync_export_collection_metadata(context)
-            (
-                sorted_count,
-                repaired_group_count,
-                removed_empty_group_count,
-                sort_warnings,
-            ) = _sort_export_vertex_groups_by_name(context, export_root)
+            sorted_count, sort_warnings = _sort_export_vertex_groups_by_name(context, export_root)
             export_stats = export_collection_package(
                 collection_name=export_root.name,
                 export_dir=scene.modimp_export_dir.strip(),
@@ -2283,9 +2252,7 @@ class MODIMP_OT_export_collection_buffers(bpy.types.Operator):
             {"INFO"},
             (
                 f"Synced {region_count} regions / {part_count} parts. "
-                f"Sorted vertex groups on {sorted_count} mesh object(s), "
-                f"repaired {repaired_group_count} duplicate group(s), "
-                f"removed {removed_empty_group_count} empty numeric group(s). "
+                f"Sorted vertex groups on {sorted_count} mesh object(s). "
                 f"Exported {export_stats['region_count']} regions, "
                 f"{export_stats['part_count']} parts / {export_stats['draw_count']} draws, "
                 f"{export_stats['vertex_count']} verts, "
