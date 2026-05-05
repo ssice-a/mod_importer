@@ -17,6 +17,7 @@ from .core.profiles import YIHUAN_PROFILE, get_profile
 
 _HASH8_RE = re.compile(r"^[0-9A-Fa-f]{8}$")
 _OBJECT_HASH_PREFIX_RE = re.compile(r"^(?P<hash>[0-9A-Fa-f]{8})(?:[-_](?P<count>\d+)(?:[-_](?P<first>\d+))?)?")
+_BLENDER_DUPLICATE_NUMERIC_GROUP_RE = re.compile(r"^(?P<base>\d+)\.\d+$")
 _COLLECTION_KIND_PROP = "modimp_kind"
 _PROFILE_ID_PROP = "modimp_profile_id"
 _SOURCE_IB_HASH_PROP = "modimp_source_ib_hash"
@@ -302,6 +303,74 @@ def _iter_collection_tree(root: bpy.types.Collection):
     yield root
     for child in root.children:
         yield from _iter_collection_tree(child)
+
+
+def _merge_vertex_group_into(
+    obj: bpy.types.Object,
+    source_group: bpy.types.VertexGroup,
+    target_group: bpy.types.VertexGroup,
+):
+    if source_group.index == target_group.index:
+        return
+    source_index = int(source_group.index)
+    weights: list[tuple[int, float]] = []
+    for vertex in obj.data.vertices:
+        for group_ref in vertex.groups:
+            if int(group_ref.group) == source_index and float(group_ref.weight) > 0.0:
+                weights.append((int(vertex.index), float(group_ref.weight)))
+                break
+    for vertex_index, weight in weights:
+        target_group.add([vertex_index], weight, "ADD")
+    obj.vertex_groups.remove(source_group)
+
+
+def _merge_blender_duplicate_numeric_vertex_groups(obj: bpy.types.Object) -> int:
+    merged_count = 0
+    for vertex_group in list(obj.vertex_groups):
+        match = _BLENDER_DUPLICATE_NUMERIC_GROUP_RE.fullmatch(vertex_group.name)
+        if match is None:
+            continue
+        base_name = match.group("base")
+        target_group = obj.vertex_groups.get(base_name)
+        if target_group is None:
+            vertex_group.name = base_name
+            merged_count += 1
+            continue
+        if target_group.index == vertex_group.index:
+            continue
+        _merge_vertex_group_into(obj, vertex_group, target_group)
+        merged_count += 1
+    return merged_count
+
+
+def _sort_export_vertex_groups_by_name(context: bpy.types.Context, export_root: bpy.types.Collection) -> tuple[int, int, list[str]]:
+    objects: dict[str, bpy.types.Object] = {}
+    for collection in _iter_collection_tree(export_root):
+        for obj in collection.objects:
+            if obj.type != "MESH":
+                continue
+            objects.setdefault(obj.name, obj)
+
+    sorted_objects = sorted(objects.values(), key=lambda obj: obj.name)
+    sorted_count = 0
+    repaired_count = 0
+    warnings: list[str] = []
+    for obj in sorted_objects:
+        repaired_count += _merge_blender_duplicate_numeric_vertex_groups(obj)
+        if len(obj.vertex_groups) < 2:
+            continue
+        try:
+            with context.temp_override(
+                active_object=obj,
+                object=obj,
+                selected_objects=[obj],
+                selected_editable_objects=[obj],
+            ):
+                bpy.ops.object.vertex_group_sort(sort_type="NAME")
+            sorted_count += 1
+        except Exception as exc:  # pylint: disable=broad-except
+            warnings.append(f"{obj.name}: vertex group sort skipped ({exc})")
+    return sorted_count, repaired_count, warnings
 
 
 def _object_source_ib_hash(obj: bpy.types.Object) -> str:
@@ -1202,6 +1271,7 @@ def _apply_bone_merge_map_to_objects(
     renamed_count = 0
     for obj in objects:
         if skip_already_applied and bool(obj.get(_BONE_MERGE_APPLIED_PROP, False)):
+            renamed_count += _merge_blender_duplicate_numeric_vertex_groups(obj)
             continue
         region_hash, index_count, first_index = _object_or_collection_region_identity(obj)
         if not region_hash:
@@ -1209,7 +1279,7 @@ def _apply_bone_merge_map_to_objects(
 
         _record_pre_bone_merge_vertex_group_names(obj)
         object_renamed = 0
-        for vertex_group in obj.vertex_groups:
+        for vertex_group in list(obj.vertex_groups):
             if not vertex_group.name.isdigit():
                 continue
             local_index = int(vertex_group.name)
@@ -1225,9 +1295,14 @@ def _apply_bone_merge_map_to_objects(
                 )
             global_name = str(int(global_index))
             if vertex_group.name != global_name:
-                vertex_group.name = global_name
+                existing_group = obj.vertex_groups.get(global_name)
+                if existing_group is not None and existing_group.index != vertex_group.index:
+                    _merge_vertex_group_into(obj, vertex_group, existing_group)
+                else:
+                    vertex_group.name = global_name
                 renamed_count += 1
                 object_renamed += 1
+        object_renamed += _merge_blender_duplicate_numeric_vertex_groups(obj)
         obj[_BONE_MERGE_APPLIED_PROP] = True
         obj["modimp_bone_merge_region_hash"] = region_hash
         if first_index is not None:
@@ -1438,7 +1513,11 @@ class MODIMP_OT_apply_bone_merge_map_to_groups(bpy.types.Operator):
             bone_merge_map = _read_text_json(_bone_merge_text_name_for_collection(collection))
             if not isinstance(bone_merge_map, dict):
                 raise ValueError("BoneMergeMap text block must contain a JSON object.")
-            renamed_count = _apply_bone_merge_map_to_objects(selected_mesh_objects, bone_merge_map)
+            renamed_count = _apply_bone_merge_map_to_objects(
+                selected_mesh_objects,
+                bone_merge_map,
+                skip_already_applied=True,
+            )
         except Exception as exc:  # pylint: disable=broad-except
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
@@ -1566,6 +1645,7 @@ class MODIMP_OT_export_collection_buffers(bpy.types.Operator):
             export_root = _export_root_for_scene(scene)
             split_stats = _auto_split_export_root_by_limits(export_root)
             region_count, part_count, missing_runtime = _sync_export_collection_metadata(context)
+            sorted_count, repaired_group_count, sort_warnings = _sort_export_vertex_groups_by_name(context, export_root)
             export_stats = export_collection_package(
                 collection_name=export_root.name,
                 export_dir=scene.modimp_export_dir.strip(),
@@ -1583,6 +1663,7 @@ class MODIMP_OT_export_collection_buffers(bpy.types.Operator):
             {"INFO"},
             (
                 f"Synced {region_count} regions / {part_count} parts. "
+                f"Sorted vertex groups on {sorted_count} mesh object(s), repaired {repaired_group_count} duplicate group(s). "
                 f"Exported {export_stats['region_count']} regions, "
                 f"{export_stats['part_count']} parts / {export_stats['draw_count']} draws, "
                 f"{export_stats['vertex_count']} verts, "
@@ -1597,6 +1678,12 @@ class MODIMP_OT_export_collection_buffers(bpy.types.Operator):
                 {"WARNING"},
                 f"Collection export contract is incomplete on: {', '.join(missing_runtime[:4])}.",
             )
+        if sort_warnings:
+            self.report(
+                {"WARNING"},
+                f"Vertex group sort skipped on {len(sort_warnings)} object(s); see console.",
+            )
+            print("\n".join(sort_warnings))
         texture_warnings = list(export_stats.get("texture_warnings", []))
         if texture_warnings:
             self.report(

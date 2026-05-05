@@ -1902,7 +1902,12 @@ def _package_material_texture_candidates(package: dict[str, object]) -> dict[str
 
 
 def _ntmi_effective_texture_slots(package: dict[str, object]) -> dict[str, dict[str, str]]:
-    slots = _ntmi_texture_slots(package)
+    slots: dict[str, dict[str, str]] = {}
+    for slot, binding in _ntmi_texture_slots(package).items():
+        source = Path(str(binding.get("source_path", "") or ""))
+        if not source.is_file():
+            continue
+        slots[slot] = dict(binding)
     for slot, path_by_key in _package_material_texture_candidates(package).items():
         if len(path_by_key) != 1:
             continue
@@ -1950,6 +1955,8 @@ def _preflight_ntmi_textures(region_packages: list[dict[str, object]]) -> list[s
 
     for package in region_packages:
         region_label = _ntmi_region_resource_token(package)
+        raw_slots = _ntmi_texture_slots(package)
+        material_candidates = _package_material_texture_candidates(package)
         slots = _ntmi_effective_texture_slots(package)
         if not slots:
             warnings.append(
@@ -1960,22 +1967,33 @@ def _preflight_ntmi_textures(region_packages: list[dict[str, object]]) -> list[s
                 if slot not in slots:
                     warnings.append(f"{region_label}: missing {slot}; material may rely on native PS bindings.")
 
-        for slot, binding in sorted(slots.items()):
+        for slot, binding in sorted(raw_slots.items()):
             source_path = Path(binding["source_path"])
             if not source_path.is_file():
-                raise ValueError(f"{region_label} {slot}: texture source file is missing: {source_path}")
+                warnings.append(
+                    f"{region_label} {slot}: texture source file is missing: {source_path}; binding will be skipped."
+                )
+
+        for slot, binding in sorted(slots.items()):
+            source_path = Path(binding["source_path"])
             if not binding.get("draw_index") or not binding.get("ps_hash") or not binding.get("rt_count"):
                 warnings.append(
                     f"{region_label} {slot}: texture metadata is incomplete; re-run FrameAnalysis/Profile "
                     "before relying on material draw grouping."
                 )
 
-        for slot, path_by_key in sorted(_package_material_texture_candidates(package).items()):
+        for slot, path_by_key in sorted(material_candidates.items()):
             if len(path_by_key) > 1:
                 warnings.append(
                     f"{region_label} {slot}: multiple material textures are used in one region. "
                     "Material draw grouping is pending, so exporter will keep the region-level texture binding for now."
                 )
+            elif len(path_by_key) == 1:
+                source_path = Path(next(iter(path_by_key.values())))
+                if not source_path.is_file():
+                    warnings.append(
+                        f"{region_label} {slot}: material texture source file is missing: {source_path}; binding will be skipped."
+                    )
 
         for obj in _package_draw_objects(package):
             used_indices = _object_used_material_indices(obj)
@@ -2216,9 +2234,7 @@ def _append_ntmi_texture_sections(
         for slot, binding in sorted(_ntmi_effective_texture_slots(package).items()):
             source_path = Path(binding["source_path"])
             if not source_path.is_file():
-                raise ValueError(
-                    f"{package['region_hash']} {slot}: texture dump file is missing: {source_path}"
-            )
+                continue
             filename = _ntmi_texture_filename(package, slot, binding)
             destination = export_root / filename
             _copy_texture_as_is(source_path, destination)
