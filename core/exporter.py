@@ -221,6 +221,28 @@ def _find_uv_layer(mesh: bpy.types.Mesh, *names: str) -> bpy.types.MeshUVLoopLay
     return None
 
 
+def _active_render_uv_layer(mesh: bpy.types.Mesh) -> bpy.types.MeshUVLoopLayer | None:
+    uv_layers = mesh.uv_layers
+    active_render = getattr(uv_layers, "active_render", None)
+    if active_render is not None:
+        return active_render
+    for uv_layer in uv_layers:
+        if bool(getattr(uv_layer, "active_render", False)):
+            return uv_layer
+    return None
+
+
+def _export_uv0_layer(mesh: bpy.types.Mesh) -> tuple[bpy.types.MeshUVLoopLayer | None, bool]:
+    render_layer = _active_render_uv_layer(mesh)
+    if render_layer is not None:
+        return render_layer, False
+    named_layer = _find_uv_layer(mesh, "UV0")
+    if named_layer is not None:
+        return named_layer, True
+    active_layer = mesh.uv_layers.active
+    return active_layer, active_layer is not None
+
+
 def _read_point_float_attribute(mesh: bpy.types.Mesh, name: str) -> list[float]:
     attribute = mesh.attributes.get(name)
     if attribute is None:
@@ -664,6 +686,7 @@ def _prepare_runtime_shapekey_sources(
 
         frame_deltas = None
         if loop_frames is not None:
+            uv0_layer, _ = _export_uv0_layer(mesh)
             frame_deltas = _evaluate_shape_key_frame_delta_by_loop(
                 obj,
                 key_block,
@@ -672,7 +695,7 @@ def _prepare_runtime_shapekey_sources(
                 current_loop_frames=loop_frames,
                 converter=converter,
                 mirror_flip=mirror_flip,
-                uv_layer_name=(mesh.uv_layers.active.name if mesh.uv_layers.active else ""),
+                uv_layer_name=(uv0_layer.name if uv0_layer else ""),
                 depsgraph=depsgraph,
             )
         if frame_deltas is None:
@@ -819,10 +842,12 @@ def _extract_object_payload(
         mesh=mesh_copy,
         bone_to_local=bone_to_local,
     )
-    uv0_layer = mesh_copy.uv_layers.active or _find_uv_layer(mesh_copy, "UV0")
+    uv0_layer, uv0_used_fallback = _export_uv0_layer(mesh_copy)
     if uv0_layer is None:
         bpy.data.meshes.remove(mesh_copy)
-        raise ValueError(f"{obj.name}: an active UV layer is required for export")
+        raise ValueError(f"{obj.name}: an active render UV layer or UV0 layer is required for export")
+    if uv0_used_fallback:
+        missing_optional_attributes.append("active_render_uv_missing_used_UV0_or_active")
     uv1_layer = _find_uv_layer(mesh_copy, "UV1")
     uv3_layer = _find_uv_layer(mesh_copy, "UV3", "packed_uv2")
     uv4_layer = _find_uv_layer(mesh_copy, "UV4", "packed_uv3")
