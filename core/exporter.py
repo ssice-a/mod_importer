@@ -27,6 +27,11 @@ from .io import (
     write_weight_pairs_buffer,
 )
 from .profiles import YIHUAN_PROFILE
+from .texture_converter import (
+    blender_image_export_source,
+    default_dds_format,
+    write_game_texture,
+)
 
 
 _REGION_HASH_RE = re.compile(r"^[0-9A-Fa-f]{8}$")
@@ -1776,6 +1781,15 @@ def _ntmi_runtime_shapekey_resource(source_suffix: str, role: str = "") -> str:
     return f"ResourceShapekeyRuntime_{_resource_token(source_suffix)}{suffix}"
 
 
+def _is_ps_texture_slot(slot: str) -> bool:
+    return re.fullmatch(r"ps-t\d+", str(slot or "").strip()) is not None
+
+
+def _ps_texture_slot_sort_key(slot: str) -> int:
+    match = re.fullmatch(r"ps-t(?P<index>\d+)", str(slot or "").strip())
+    return int(match.group("index")) if match else 999
+
+
 def _ntmi_texture_slots(package: dict[str, object]) -> dict[str, dict[str, str]]:
     runtime_contract = dict(package.get("runtime_contract", {}))
     raw_slots = str(runtime_contract.get("texture_slots", "") or "").strip()
@@ -1790,7 +1804,7 @@ def _ntmi_texture_slots(package: dict[str, object]) -> dict[str, dict[str, str]]
 
     slots: dict[str, dict[str, str]] = {}
     for slot, raw_binding in payload.items():
-        if slot not in {"ps-t5", "ps-t7", "ps-t8", "ps-t18"}:
+        if not _is_ps_texture_slot(slot):
             continue
         if not isinstance(raw_binding, dict):
             continue
@@ -1805,6 +1819,7 @@ def _ntmi_texture_slots(package: dict[str, object]) -> dict[str, dict[str, str]]
             "hash": hash_value,
             "source_path": source_path,
             "extension": extension,
+            "semantic": str(raw_binding.get("semantic", "") or "").strip(),
             "draw_index": str(raw_binding.get("draw_index", "") or "").strip(),
             "ps_hash": str(raw_binding.get("ps_hash", "") or "").strip().lower(),
             "rt_count": str(raw_binding.get("rt_count", "") or "").strip(),
@@ -1835,7 +1850,7 @@ def _object_used_material_indices(obj: bpy.types.Object) -> set[int]:
 def _image_source_path(image: bpy.types.Image | None) -> str:
     if image is None:
         return ""
-    filepath = str(getattr(image, "filepath", "") or getattr(image, "filepath_raw", "") or "").strip()
+    filepath = str(blender_image_export_source(image) or "").strip()
     if not filepath:
         return ""
     try:
@@ -1944,9 +1959,32 @@ def _package_draw_objects(package: dict[str, object]) -> list[bpy.types.Object]:
     return sorted(objects.values(), key=lambda item: item.name)
 
 
-def _copy_texture_as_is(source_path: Path, destination: Path):
+def _texture_binding_semantic(slot: str, binding: dict[str, str]) -> str:
+    semantic = str(binding.get("semantic", "") or "").strip().lower()
+    if semantic:
+        return semantic
+    if slot == "ps-t7":
+        return "base_color"
+    if slot == "ps-t5":
+        return "normal"
+    return ""
+
+
+def _write_texture_for_game(source_path: Path, destination: Path, *, slot: str, binding: dict[str, str]):
     _ensure_directory(destination.parent)
-    shutil.copy2(source_path, destination)
+    semantic = _texture_binding_semantic(slot, binding)
+    dxgi_format = default_dds_format(
+        slot=slot,
+        semantic=semantic,
+        source_path=str(binding.get("source_path", "") or source_path),
+    )
+    write_game_texture(
+        source_path,
+        destination,
+        slot=slot,
+        semantic=semantic,
+        dxgi_format=dxgi_format,
+    )
 
 
 def _preflight_ntmi_textures(region_packages: list[dict[str, object]]) -> list[str]:
@@ -2024,12 +2062,7 @@ def _ntmi_texture_resource_name(package: dict[str, object], slot: str) -> str:
 def _ntmi_texture_filename(package: dict[str, object], slot: str, binding: dict[str, str]) -> str:
     slot_token = slot.replace("ps-", "").replace("-", "_")
     hash_value = _resource_token(binding["hash"])
-    source_path = Path(str(binding.get("source_path", "") or ""))
-    extension = str(binding.get("extension", "") or "").strip().lower().lstrip(".")
-    if not extension:
-        extension = source_path.suffix.lower().lstrip(".") or "dds"
-    extension = re.sub(r"[^0-9a-z]+", "", extension) or "dds"
-    return f"Texture/{_ntmi_region_resource_token(package)}-{slot_token}-{hash_value}.{extension}"
+    return f"Texture/{_ntmi_region_resource_token(package)}-{slot_token}-{hash_value}.dds"
 
 
 def _ntmi_palette_resource(part: dict[str, object]) -> str:
@@ -2231,13 +2264,16 @@ def _append_ntmi_texture_sections(
     _ensure_directory(export_root / "Texture")
     wrote_any = False
     for package in region_packages:
-        for slot, binding in sorted(_ntmi_effective_texture_slots(package).items()):
+        for slot, binding in sorted(
+            _ntmi_effective_texture_slots(package).items(),
+            key=lambda item: _ps_texture_slot_sort_key(item[0]),
+        ):
             source_path = Path(binding["source_path"])
             if not source_path.is_file():
                 continue
             filename = _ntmi_texture_filename(package, slot, binding)
             destination = export_root / filename
-            _copy_texture_as_is(source_path, destination)
+            _write_texture_for_game(source_path, destination, slot=slot, binding=binding)
             lines.extend(
                 [
                     f"[{_ntmi_texture_resource_name(package, slot)}]",
@@ -2489,9 +2525,7 @@ def _append_ntmi_draw_lines(lines: list[str], part: dict[str, object]):
 
 
 def _append_ntmi_texture_bindings_for_package(lines: list[str], package: dict[str, object]):
-    for slot in ("ps-t5", "ps-t7", "ps-t8", "ps-t18"):
-        if slot not in _ntmi_effective_texture_slots(package):
-            continue
+    for slot in sorted(_ntmi_effective_texture_slots(package), key=_ps_texture_slot_sort_key):
         lines.append(f"{slot} = {_ntmi_texture_resource_name(package, slot)}")
 
 

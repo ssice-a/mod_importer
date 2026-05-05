@@ -24,9 +24,12 @@ if bpy is not None:
         operators.MODIMP_OT_resolve_from_ib_hash,
         operators.MODIMP_OT_import_resolved_model,
         operators.MODIMP_OT_analyze_frame_stages,
+        operators.MODIMP_OT_mark_texture_semantic,
+        operators.MODIMP_OT_apply_texture_marks_to_models,
         operators.MODIMP_OT_apply_bone_merge_map_to_groups,
         operators.MODIMP_OT_restore_vertex_group_names,
         operators.MODIMP_OT_export_collection_buffers,
+        panel.MODIMP_UL_texture_mark_candidates,
         panel.VIEW3D_PT_mod_importer,
     )
 else:
@@ -51,6 +54,7 @@ def unregister():
         return
     for blender_class in reversed(REGISTERED_CLASSES):
         bpy.utils.unregister_class(blender_class)
+    panel.unregister_preview_cache()
     properties.unregister_addon_properties()
 
 

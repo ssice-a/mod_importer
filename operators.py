@@ -10,7 +10,7 @@ import bpy
 
 from .core.discovery import analyze_yihuan_frame_stages, discover_yihuan_model, resolve_yihuan_bundle_from_ib_hash
 from .core.exporter import export_collection_package
-from .core.importer import import_detected_model
+from .core.importer import apply_material_from_texture_slot_payload, import_detected_model
 from .core.io import read_u32_buffer
 from .core.profiles import YIHUAN_PROFILE, get_profile
 
@@ -41,6 +41,7 @@ _BMC_CHUNK_INDEX_PROP = "modimp_bmc_chunk_index"
 _BONE_MERGE_MAP_TEXT_PROP = "modimp_bone_merge_map_text"
 _CS_COLLECT_MAP_TEXT_PROP = "modimp_cs_collect_map_text"
 _DRAW_PASS_MAP_TEXT_PROP = "modimp_draw_pass_map_text"
+_TEXTURE_MARKS_TEXT_PROP = "modimp_texture_marks_text"
 _EXPORT_ROOT_COLLECTION_PROP = "modimp_export_root_collection"
 _PRE_BONE_MERGE_VERTEX_GROUP_NAMES_PROP = "modimp_pre_bone_merge_vertex_group_names"
 _BONE_MERGE_APPLIED_PROP = "modimp_bone_merge_groups_applied"
@@ -126,6 +127,9 @@ def _slice_runtime_contract(detected_slice) -> dict[str, object]:
             "hash": binding.hash_value,
             "source_path": binding.source_path,
             "extension": binding.extension,
+            "draw_index": binding.draw_index,
+            "ps_hash": binding.ps_hash or "",
+            "rt_count": binding.rt_count,
         }
         for slot, binding in sorted(detected_slice.texture_slots.items())
     }
@@ -136,6 +140,348 @@ def _slice_runtime_contract(detected_slice) -> dict[str, object]:
         _MATCH_VS_OUTLINE_HASH_PROP: detected_slice.match_vs_outline_hash,
         _TEXTURE_SLOTS_PROP: json.dumps(texture_slots, ensure_ascii=False),
     }
+
+
+def _region_key(region_hash: str, index_count: int | None, first_index: int | None) -> str:
+    if index_count is None or first_index is None:
+        return region_hash.lower()
+    return f"{region_hash.lower()}_{int(index_count)}_{int(first_index)}"
+
+
+def _draw_row_region_key(draw: dict[str, object]) -> str:
+    region_hash = str(draw.get("raw_ib_hash", "") or "").strip().lower()
+    index_count = int(draw.get("index_count", 0) or 0)
+    first_index = int(draw.get("first_index", 0) or 0)
+    if not region_hash:
+        return ""
+    return _region_key(region_hash, index_count, first_index)
+
+
+def _texture_slot_payload_from_draw(draw: dict[str, object], slot: str) -> dict[str, object] | None:
+    ps_paths = draw.get("ps_resource_paths", {})
+    ps_hashes = draw.get("ps_resource_hashes", {})
+    if not isinstance(ps_paths, dict) or not isinstance(ps_hashes, dict):
+        return None
+    source_path = str(ps_paths.get(slot, "") or "").strip()
+    hash_value = str(ps_hashes.get(slot, "") or "").strip().lower()
+    if not source_path or not hash_value:
+        return None
+    extension = Path(source_path).suffix.lower().lstrip(".") or "dds"
+    return {
+        "slot": slot,
+        "hash": hash_value,
+        "source_path": source_path,
+        "extension": extension,
+        "draw_index": int(draw.get("event_index", 0) or 0),
+        "ps_hash": str(draw.get("ps_hash", "") or "").strip().lower(),
+        "rt_count": int(draw.get("rt_count", 0) or 0),
+    }
+
+
+def _texture_slots_from_mark_payload(payload: dict[str, object], region_key: str) -> dict[str, dict[str, object]]:
+    marks = payload.get("marks", {})
+    candidates = payload.get("candidates", {})
+    if not isinstance(marks, dict) or not isinstance(candidates, dict):
+        return {}
+    region_marks = marks.get(region_key, {})
+    region_candidates = candidates.get(region_key, {})
+    if not isinstance(region_marks, dict) or not isinstance(region_candidates, dict):
+        return {}
+
+    slots: dict[str, dict[str, object]] = {}
+    for draw_key, slot_marks in region_marks.items():
+        if not isinstance(slot_marks, dict):
+            continue
+        draw_candidates = region_candidates.get(str(draw_key), {})
+        if not isinstance(draw_candidates, dict):
+            continue
+        for slot, mark in slot_marks.items():
+            if not isinstance(mark, dict):
+                continue
+            candidate = draw_candidates.get(slot)
+            if not isinstance(candidate, dict):
+                continue
+            binding = dict(candidate)
+            binding["semantic"] = str(mark.get("semantic", "") or "")
+            binding["semantic_index"] = int(mark.get("semantic_index", 0) or 0)
+            slots[slot] = binding
+    return slots
+
+
+def _remove_unique_region_texture_semantic(
+    region_marks: dict[str, object],
+    semantic: str,
+    *,
+    keep_draw_key: str,
+    keep_slot: str,
+):
+    if semantic not in {"base_color", "normal"}:
+        return
+    for draw_key, slot_marks in list(region_marks.items()):
+        if not isinstance(slot_marks, dict):
+            continue
+        for slot, mark in list(slot_marks.items()):
+            if draw_key == keep_draw_key and slot == keep_slot:
+                continue
+            if isinstance(mark, dict) and mark.get("semantic") == semantic:
+                slot_marks.pop(slot, None)
+
+
+def _used_region_semantic_indices(
+    region_marks: dict[str, object],
+    semantic: str,
+    *,
+    skip_draw_key: str,
+    skip_slot: str,
+) -> set[int]:
+    used: set[int] = set()
+    for draw_key, slot_marks in region_marks.items():
+        if not isinstance(slot_marks, dict):
+            continue
+        for slot, mark in slot_marks.items():
+            if draw_key == skip_draw_key and slot == skip_slot:
+                continue
+            if isinstance(mark, dict) and mark.get("semantic") == semantic:
+                used.add(int(mark.get("semantic_index", 0) or 0))
+    return used
+
+
+def _texture_marks_text_name_for_collection(collection: bpy.types.Collection) -> str:
+    existing_name = _optional_str_prop(collection, _TEXTURE_MARKS_TEXT_PROP)
+    source_hash = _optional_str_prop(collection, _SOURCE_IB_HASH_PROP) or collection.name
+    safe_hash = source_hash.lower() if _HASH8_RE.fullmatch(source_hash.lower()) else "working"
+    desired_name = f"modimp_{safe_hash}_texture_marks.json"
+    return existing_name or desired_name
+
+
+def _texture_draw_score(draw: dict[str, object]) -> tuple[int, int, int, int]:
+    ps_hashes = draw.get("ps_resource_hashes", {})
+    if not isinstance(ps_hashes, dict):
+        ps_hashes = {}
+    texture_count = sum(1 for slot in ps_hashes if str(slot).startswith("ps-t"))
+    return (
+        texture_count,
+        int(draw.get("rt_count", 0) or 0),
+        int(draw.get("index_count", 0) or 0),
+        int(draw.get("event_index", 0) or 0),
+    )
+
+
+def _build_texture_mark_payload(
+    *,
+    source_ib_hash: str,
+    summary: dict[str, object],
+    existing_payload: dict[str, object] | None = None,
+) -> dict[str, object]:
+    old_marks = {}
+    if isinstance(existing_payload, dict) and isinstance(existing_payload.get("marks"), dict):
+        old_marks = existing_payload["marks"]
+
+    candidates: dict[str, dict[str, dict[str, object]]] = {}
+    draw_meta: dict[str, dict[str, dict[str, object]]] = {}
+    for raw_draw in summary.get("draws", []):
+        if not isinstance(raw_draw, dict):
+            continue
+        region = _draw_row_region_key(raw_draw)
+        if not region:
+            continue
+        draw_key = str(int(raw_draw.get("event_index", 0) or 0))
+        slot_payloads: dict[str, dict[str, object]] = {}
+        ps_paths = raw_draw.get("ps_resource_paths", {})
+        if not isinstance(ps_paths, dict):
+            ps_paths = {}
+        for slot in sorted(ps_paths, key=lambda item: int(str(item).split("-t")[-1]) if str(item).startswith("ps-t") and str(item).split("-t")[-1].isdigit() else 999):
+            payload = _texture_slot_payload_from_draw(raw_draw, str(slot))
+            if payload is not None:
+                slot_payloads[str(slot)] = payload
+        if not slot_payloads:
+            continue
+        candidates.setdefault(region, {})[draw_key] = slot_payloads
+        draw_meta.setdefault(region, {})[draw_key] = {
+            "event_index": int(raw_draw.get("event_index", 0) or 0),
+            "ps_hash": str(raw_draw.get("ps_hash", "") or ""),
+            "rt_count": int(raw_draw.get("rt_count", 0) or 0),
+            "index_count": int(raw_draw.get("index_count", 0) or 0),
+            "first_index": int(raw_draw.get("first_index", 0) or 0),
+            "score": list(_texture_draw_score(raw_draw)),
+        }
+
+    default_draws: dict[str, str] = {}
+    draws_by_key = {
+        str(int(draw.get("event_index", 0) or 0)): draw
+        for draw in summary.get("draws", [])
+        if isinstance(draw, dict)
+    }
+    for region, draw_candidates in candidates.items():
+        best_key = max(draw_candidates, key=lambda key: _texture_draw_score(draws_by_key.get(key, {})))
+        default_draws[region] = best_key
+
+    return {
+        "version": 1,
+        "profile_id": YIHUAN_PROFILE.profile_id,
+        "source_ib_hash": source_ib_hash.lower(),
+        "candidates": candidates,
+        "draws": draw_meta,
+        "default_draws": default_draws,
+        "marks": old_marks,
+    }
+
+
+def _read_texture_marks_payload(collection: bpy.types.Collection) -> dict[str, object]:
+    text_name = _optional_str_prop(collection, _TEXTURE_MARKS_TEXT_PROP)
+    if not text_name:
+        return {}
+    payload = _read_text_json(text_name)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_texture_marks_payload(collection: bpy.types.Collection, payload: dict[str, object]) -> bpy.types.Text:
+    text = _write_text_json(_texture_marks_text_name_for_collection(collection), payload)
+    collection[_TEXTURE_MARKS_TEXT_PROP] = text.name
+    return text
+
+
+def _write_texture_marks_to_collection(
+    collection: bpy.types.Collection,
+    *,
+    source_ib_hash: str,
+    summary: dict[str, object],
+) -> dict[str, object]:
+    existing_payload = _read_texture_marks_payload(collection)
+    payload = _build_texture_mark_payload(
+        source_ib_hash=source_ib_hash,
+        summary=summary,
+        existing_payload=existing_payload,
+    )
+    _write_texture_marks_payload(collection, payload)
+    return payload
+
+
+def _apply_texture_marks_to_region_collection(
+    region_collection: bpy.types.Collection,
+    texture_payload: dict[str, object],
+):
+    region_hash, index_count, first_index = _collection_region_identity(region_collection)
+    region = _region_key(region_hash, index_count, first_index) if region_hash else ""
+    if not region:
+        return
+    slots = _texture_slots_from_mark_payload(texture_payload, region)
+    if slots:
+        region_collection[_TEXTURE_SLOTS_PROP] = json.dumps(slots, ensure_ascii=False)
+
+
+def _apply_texture_marks_to_export_regions(
+    export_root: bpy.types.Collection,
+    texture_payload: dict[str, object],
+):
+    if not texture_payload:
+        return
+    for collection in _iter_collection_tree(export_root):
+        if _optional_str_prop(collection, _COLLECTION_KIND_PROP) == "region":
+            _apply_texture_marks_to_region_collection(collection, texture_payload)
+
+
+def _apply_texture_marks_to_object(obj: bpy.types.Object, texture_payload: dict[str, object]) -> bool:
+    region_hash, index_count, first_index = _object_region_identity(obj)
+    region = _region_key(region_hash, index_count, first_index) if region_hash else ""
+    if not region:
+        return False
+    slots = _texture_slots_from_mark_payload(texture_payload, region)
+    if not slots:
+        return False
+    obj[_TEXTURE_SLOTS_PROP] = json.dumps(slots, ensure_ascii=False)
+    return bool(apply_material_from_texture_slot_payload(obj, slots, clear_existing=True))
+
+
+def _apply_texture_slots_to_object(obj: bpy.types.Object, slots: dict[str, dict[str, object]]) -> bool:
+    if obj.type != "MESH" or not slots:
+        return False
+    obj[_TEXTURE_SLOTS_PROP] = json.dumps(slots, ensure_ascii=False)
+    return bool(apply_material_from_texture_slot_payload(obj, slots, clear_existing=True))
+
+
+def _selected_mesh_objects(context: bpy.types.Context) -> list[bpy.types.Object]:
+    return [obj for obj in context.selected_objects if obj.type == "MESH"]
+
+
+def _apply_texture_marks_to_objects_in_collection(
+    collection: bpy.types.Collection,
+    texture_payload: dict[str, object],
+) -> tuple[int, int]:
+    visited: set[str] = set()
+    matched = 0
+    applied = 0
+    for child in _iter_collection_tree(collection):
+        for obj in child.objects:
+            if obj.name in visited or obj.type != "MESH":
+                continue
+            visited.add(obj.name)
+            region_hash, index_count, first_index = _object_region_identity(obj)
+            region = _region_key(region_hash, index_count, first_index) if region_hash else ""
+            if not region or not _texture_slots_from_mark_payload(texture_payload, region):
+                continue
+            matched += 1
+            if _apply_texture_marks_to_object(obj, texture_payload):
+                applied += 1
+    return matched, applied
+
+
+def _apply_current_texture_region_to_selected_or_collection(
+    context: bpy.types.Context,
+    collection: bpy.types.Collection,
+    texture_payload: dict[str, object],
+) -> tuple[int, int]:
+    region = str(context.scene.modimp_texture_mark_region or "").strip()
+    if not region or region == "__none__":
+        return 0, 0
+    slots = _texture_slots_from_mark_payload(texture_payload, region)
+    if not slots:
+        return 0, 0
+
+    objects = _selected_mesh_objects(context)
+    if not objects:
+        visited: set[str] = set()
+        for child in _iter_collection_tree(collection):
+            for obj in child.objects:
+                if obj.name in visited or obj.type != "MESH":
+                    continue
+                visited.add(obj.name)
+                objects.append(obj)
+
+    matched = 0
+    applied = 0
+    for obj in objects:
+        matched += 1
+        if _apply_texture_slots_to_object(obj, slots):
+            applied += 1
+    return matched, applied
+
+
+def _set_default_texture_mark_selection(scene: bpy.types.Scene, collection: bpy.types.Collection):
+    payload = _read_texture_marks_payload(collection)
+    candidates = payload.get("candidates", {}) if isinstance(payload, dict) else {}
+    default_draws = payload.get("default_draws", {}) if isinstance(payload, dict) else {}
+    if not isinstance(candidates, dict) or not candidates:
+        return
+    current_region = str(getattr(scene, "modimp_texture_mark_region", "") or "")
+    region_key = current_region if current_region in candidates else next(iter(candidates))
+    try:
+        scene.modimp_texture_mark_region = region_key
+    except TypeError:
+        return
+    if isinstance(default_draws, dict):
+        draw_key = str(default_draws.get(region_key, "") or "")
+        if draw_key:
+            try:
+                scene.modimp_texture_mark_draw = draw_key
+            except TypeError:
+                pass
+    try:
+        from . import properties as addon_properties
+
+        addon_properties.sync_texture_mark_items(scene)
+    except Exception:
+        pass
 
 
 def _object_runtime_contract(obj: bpy.types.Object) -> dict[str, object]:
@@ -296,6 +642,7 @@ def _copy_export_text_props(source: bpy.types.Collection, target: bpy.types.Coll
         _BONE_MERGE_MAP_TEXT_PROP,
         _CS_COLLECT_MAP_TEXT_PROP,
         _DRAW_PASS_MAP_TEXT_PROP,
+        _TEXTURE_MARKS_TEXT_PROP,
         *_COLLECTOR_RUNTIME_PROPS,
     ):
         value = _optional_str_prop(source, key)
@@ -389,7 +736,45 @@ def _merge_blender_duplicate_numeric_vertex_groups(obj: bpy.types.Object) -> int
     return merged_count
 
 
-def _sort_export_vertex_groups_by_name(context: bpy.types.Context, export_root: bpy.types.Collection) -> tuple[int, int, list[str]]:
+def _positive_weight_group_indices(obj: bpy.types.Object) -> set[int]:
+    used: set[int] = set()
+    for vertex in obj.data.vertices:
+        for group_ref in vertex.groups:
+            if float(group_ref.weight) > 0.0:
+                used.add(int(group_ref.group))
+    return used
+
+
+def _remove_empty_numeric_vertex_groups(obj: bpy.types.Object) -> int:
+    used_indices = _positive_weight_group_indices(obj)
+    removed_count = 0
+    for vertex_group in list(obj.vertex_groups):
+        if not vertex_group.name.isdigit():
+            continue
+        if int(vertex_group.index) in used_indices:
+            continue
+        obj.vertex_groups.remove(vertex_group)
+        removed_count += 1
+    return removed_count
+
+
+def _numeric_vertex_group_summary(obj: bpy.types.Object) -> tuple[list[int], list[int], int, int]:
+    numeric_groups = sorted(
+        {
+            int(vertex_group.name)
+            for vertex_group in obj.vertex_groups
+            if vertex_group.name.isdigit()
+        }
+    )
+    if not numeric_groups:
+        return [], [], -1, -1
+    min_group = numeric_groups[0]
+    max_group = numeric_groups[-1]
+    missing = [value for value in range(min_group, max_group + 1) if value not in set(numeric_groups)]
+    return numeric_groups, missing, min_group, max_group
+
+
+def _sort_export_vertex_groups_by_name(context: bpy.types.Context, export_root: bpy.types.Collection) -> tuple[int, int, int, list[str]]:
     objects: dict[str, bpy.types.Object] = {}
     for collection in _iter_collection_tree(export_root):
         for obj in collection.objects:
@@ -400,9 +785,11 @@ def _sort_export_vertex_groups_by_name(context: bpy.types.Context, export_root: 
     sorted_objects = sorted(objects.values(), key=lambda obj: obj.name)
     sorted_count = 0
     repaired_count = 0
+    removed_empty_count = 0
     warnings: list[str] = []
     for obj in sorted_objects:
         repaired_count += _merge_blender_duplicate_numeric_vertex_groups(obj)
+        removed_empty_count += _remove_empty_numeric_vertex_groups(obj)
         if len(obj.vertex_groups) < 2:
             continue
         try:
@@ -416,7 +803,7 @@ def _sort_export_vertex_groups_by_name(context: bpy.types.Context, export_root: 
             sorted_count += 1
         except Exception as exc:  # pylint: disable=broad-except
             warnings.append(f"{obj.name}: vertex group sort skipped ({exc})")
-    return sorted_count, repaired_count, warnings
+    return sorted_count, repaired_count, removed_empty_count, warnings
 
 
 def _object_source_ib_hash(obj: bpy.types.Object) -> str:
@@ -1283,6 +1670,11 @@ def _write_frame_analysis_maps_to_collection(
     )
     collection[_CS_COLLECT_MAP_TEXT_PROP] = cs_text.name
     collection[_DRAW_PASS_MAP_TEXT_PROP] = draw_text.name
+    _write_texture_marks_to_collection(
+        collection,
+        source_ib_hash=source_ib_hash,
+        summary=summary,
+    )
     return bone_merge_map
 
 
@@ -1413,14 +1805,20 @@ class MODIMP_OT_import_resolved_model(bpy.types.Operator):
         _ensure_supported_profile(scene)
 
         try:
+            cache_collection_name = _scene_collection_name(scene) or scene.modimp_ib_hash.strip().lower()
+            cache_collection = bpy.data.collections.get(cache_collection_name) if cache_collection_name else None
+            has_analysis_cache = bool(
+                cache_collection is not None
+                and _optional_str_prop(cache_collection, _BONE_MERGE_MAP_TEXT_PROP)
+                and _optional_str_prop(cache_collection, _DRAW_PASS_MAP_TEXT_PROP)
+            )
             detected_model, summary, _resolved_bundle = _load_model_workflow_from_scene(
                 scene,
                 need_detected_model=True,
-                need_summary=True,
+                need_summary=not has_analysis_cache,
                 need_resolved_bundle=True,
             )
             assert detected_model is not None
-            assert summary is not None
             assert _resolved_bundle is not None
             _apply_detected_model_to_scene(scene, detected_model)
 
@@ -1442,23 +1840,32 @@ class MODIMP_OT_import_resolved_model(bpy.types.Operator):
             )
             working_collection = _ensure_scene_collection_linked(scene, collection_name)
             _mark_source_collection(working_collection, detected_model.ib_hash)
-            bone_merge_map = _write_frame_analysis_maps_to_collection(
-                working_collection,
-                source_ib_hash=detected_model.ib_hash,
-                detected_model=detected_model,
-                summary=summary,
-            )
+            if summary is not None:
+                bone_merge_map = _write_frame_analysis_maps_to_collection(
+                    working_collection,
+                    source_ib_hash=detected_model.ib_hash,
+                    detected_model=detected_model,
+                    summary=summary,
+                )
+            else:
+                bone_merge_map = _read_text_json(_bone_merge_text_name_for_collection(working_collection))
+                if not isinstance(bone_merge_map, dict):
+                    raise ValueError("Cached BoneMergeMap text block must contain a JSON object.")
             _apply_resolved_bundle_to_scene(scene, _resolved_bundle)
             renamed_groups = _apply_bone_merge_map_to_objects(imported_objects, bone_merge_map)
             export_root = _ensure_export_root_collection(scene, working_collection, detected_model.ib_hash)
             _copy_export_text_props(working_collection, export_root)
+            texture_payload = _read_texture_marks_payload(working_collection)
             for imported_object in imported_objects:
-                _ensure_export_region_collection_for_object(
+                _apply_texture_marks_to_object(imported_object, texture_payload)
+                region_collection = _ensure_export_region_collection_for_object(
                     export_root,
                     imported_object,
                     source_ib_hash=detected_model.ib_hash,
                     link_object=False,
                 )
+                _apply_texture_marks_to_region_collection(region_collection, texture_payload)
+            _set_default_texture_mark_selection(scene, working_collection)
         except Exception as exc:  # pylint: disable=broad-except
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
@@ -1518,6 +1925,7 @@ class MODIMP_OT_analyze_frame_stages(bpy.types.Operator):
             summary=summary,
         )
         _copy_export_text_props(collection, export_root)
+        _set_default_texture_mark_selection(scene, collection)
 
         collector_collect_key = _optional_str_prop(collection, _COLLECTOR_COLLECT_KEY_PROP)
         collector_finish = _optional_str_prop(collection, _COLLECTOR_FINISH_CONDITION_PROP)
@@ -1533,6 +1941,148 @@ class MODIMP_OT_analyze_frame_stages(bpy.types.Operator):
             {"INFO"},
             f"Analyzed FrameAnalysis: {scene.modimp_frame_analysis_summary}. See {report_text.name}.",
         )
+        return {"FINISHED"}
+
+
+class MODIMP_OT_mark_texture_semantic(bpy.types.Operator):
+    """Mark one analyzed texture as a semantic texture role."""
+
+    bl_idname = "modimp.mark_texture_semantic"
+    bl_label = "Mark Texture"
+    bl_description = "Mark the selected draw texture as base color, normal, material, or effect"
+    bl_options = {"REGISTER", "UNDO"}
+
+    slot: bpy.props.StringProperty(name="PS Slot", default="")
+    semantic: bpy.props.EnumProperty(
+        name="Semantic",
+        items=(
+            ("base_color", "基础色", "Base color texture"),
+            ("normal", "法线", "Normal map texture"),
+            ("material", "材质", "Material/ORM/detail texture"),
+            ("effect", "特效", "Effect/emission/special texture"),
+            ("clear", "清除", "Remove manual mark"),
+        ),
+        default="base_color",
+    )
+
+    def execute(self, context):
+        scene = context.scene
+        try:
+            collection = _working_collection(scene)
+            payload = _read_texture_marks_payload(collection)
+            if not payload:
+                raise ValueError("Run Analyze first so texture candidates are cached.")
+            region_key = str(scene.modimp_texture_mark_region or "").strip()
+            draw_key = str(scene.modimp_texture_mark_draw or "").strip()
+            slot = self.slot.strip()
+            if not region_key or region_key == "__none__":
+                raise ValueError("Select a texture region first.")
+            if not draw_key or draw_key == "__none__":
+                raise ValueError("Select a texture draw first.")
+            candidates = payload.get("candidates", {})
+            if not isinstance(candidates, dict):
+                raise ValueError("Texture mark cache is missing candidates.")
+            region_candidates = candidates.get(region_key, {})
+            draw_candidates = region_candidates.get(draw_key, {}) if isinstance(region_candidates, dict) else {}
+            if not isinstance(draw_candidates, dict) or slot not in draw_candidates:
+                raise ValueError(f"Texture candidate not found for {region_key} draw {draw_key} slot {slot}.")
+
+            marks = payload.setdefault("marks", {})
+            if not isinstance(marks, dict):
+                marks = {}
+                payload["marks"] = marks
+            region_marks = marks.setdefault(region_key, {})
+            if not isinstance(region_marks, dict):
+                region_marks = {}
+                marks[region_key] = region_marks
+            draw_marks = region_marks.setdefault(draw_key, {})
+            if not isinstance(draw_marks, dict):
+                draw_marks = {}
+                region_marks[draw_key] = draw_marks
+
+            if self.semantic == "clear":
+                draw_marks.pop(slot, None)
+            else:
+                existing = draw_marks.get(slot, {})
+                _remove_unique_region_texture_semantic(
+                    region_marks,
+                    self.semantic,
+                    keep_draw_key=draw_key,
+                    keep_slot=slot,
+                )
+                if isinstance(existing, dict) and existing.get("semantic") == self.semantic:
+                    semantic_index = int(existing.get("semantic_index", 0) or 0)
+                elif self.semantic in {"base_color", "normal"}:
+                    semantic_index = 0
+                else:
+                    used_indices = _used_region_semantic_indices(
+                        region_marks,
+                        self.semantic,
+                        skip_draw_key=draw_key,
+                        skip_slot=slot,
+                    )
+                    semantic_index = 0
+                    while semantic_index in used_indices:
+                        semantic_index += 1
+                draw_marks[slot] = {
+                    "semantic": self.semantic,
+                    "semantic_index": semantic_index,
+                }
+
+            _write_texture_marks_payload(collection, payload)
+            export_root = _export_root_for_scene(scene, create=True)
+            _apply_texture_marks_to_export_regions(export_root, payload)
+            matched, applied = _apply_texture_marks_to_objects_in_collection(collection, payload)
+            if matched == 0:
+                matched, applied = _apply_current_texture_region_to_selected_or_collection(context, collection, payload)
+            try:
+                from . import properties as addon_properties
+
+                addon_properties.sync_texture_mark_items(scene)
+            except Exception:
+                pass
+        except Exception as exc:  # pylint: disable=broad-except
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+        self.report(
+            {"INFO"},
+            f"Texture mark updated: {self.slot} -> {self.semantic}; applied materials {applied}/{matched}.",
+        )
+        return {"FINISHED"}
+
+
+class MODIMP_OT_apply_texture_marks_to_models(bpy.types.Operator):
+    """Apply cached texture marks to already imported objects."""
+
+    bl_idname = "modimp.apply_texture_marks_to_models"
+    bl_label = "Apply Texture Marks To Models"
+    bl_description = "Create/update materials on existing imported meshes using the current texture marks"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        scene = context.scene
+        try:
+            collection = _working_collection(scene)
+            payload = _read_texture_marks_payload(collection)
+            if not payload:
+                raise ValueError("Run Analyze and mark textures first.")
+            matched, applied = _apply_texture_marks_to_objects_in_collection(collection, payload)
+            export_root = _find_export_root_collection(collection)
+            if export_root is not None and export_root != collection:
+                export_matched, export_applied = _apply_texture_marks_to_objects_in_collection(export_root, payload)
+                matched += export_matched
+                applied += export_applied
+            if matched == 0:
+                matched, applied = _apply_current_texture_region_to_selected_or_collection(context, collection, payload)
+        except Exception as exc:  # pylint: disable=broad-except
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+        if matched == 0:
+            self.report({"WARNING"}, "No existing mesh objects matched current texture marks.")
+        else:
+            self.report({"INFO"}, f"Applied texture marks to {applied}/{matched} matching mesh objects.")
         return {"FINISHED"}
 
 
@@ -1698,7 +2248,12 @@ class MODIMP_OT_export_collection_buffers(bpy.types.Operator):
             export_root = _export_root_for_scene(scene)
             split_stats = _auto_split_export_root_by_limits(export_root)
             region_count, part_count, missing_runtime = _sync_export_collection_metadata(context)
-            sorted_count, repaired_group_count, sort_warnings = _sort_export_vertex_groups_by_name(context, export_root)
+            (
+                sorted_count,
+                repaired_group_count,
+                removed_empty_group_count,
+                sort_warnings,
+            ) = _sort_export_vertex_groups_by_name(context, export_root)
             export_stats = export_collection_package(
                 collection_name=export_root.name,
                 export_dir=scene.modimp_export_dir.strip(),
@@ -1716,7 +2271,9 @@ class MODIMP_OT_export_collection_buffers(bpy.types.Operator):
             {"INFO"},
             (
                 f"Synced {region_count} regions / {part_count} parts. "
-                f"Sorted vertex groups on {sorted_count} mesh object(s), repaired {repaired_group_count} duplicate group(s). "
+                f"Sorted vertex groups on {sorted_count} mesh object(s), "
+                f"repaired {repaired_group_count} duplicate group(s), "
+                f"removed {removed_empty_group_count} empty numeric group(s). "
                 f"Exported {export_stats['region_count']} regions, "
                 f"{export_stats['part_count']} parts / {export_stats['draw_count']} draws, "
                 f"{export_stats['vertex_count']} verts, "

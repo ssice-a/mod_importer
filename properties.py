@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import json
+
 import bpy
 
 from .core.profiles import PROFILE_ITEMS, YIHUAN_PROFILE
+
+
+_DRAW_PASS_MAP_TEXT_PROP = "modimp_draw_pass_map_text"
+_TEXTURE_MARKS_TEXT_PROP = "modimp_texture_marks_text"
 
 
 REGISTERED_PROPERTY_PATHS = (
@@ -14,6 +20,11 @@ REGISTERED_PROPERTY_PATHS = (
     (bpy.types.Scene, "modimp_ui_show_import_advanced"),
     (bpy.types.Scene, "modimp_ui_show_import_details"),
     (bpy.types.Scene, "modimp_ui_show_export_advanced"),
+    (bpy.types.Scene, "modimp_ui_show_texture_marking"),
+    (bpy.types.Scene, "modimp_texture_mark_region"),
+    (bpy.types.Scene, "modimp_texture_mark_draw"),
+    (bpy.types.Scene, "modimp_texture_mark_items"),
+    (bpy.types.Scene, "modimp_texture_mark_index"),
     (bpy.types.Scene, "modimp_object_prefix"),
     (bpy.types.Scene, "modimp_collection_name"),
     (bpy.types.Scene, "modimp_export_collection_name"),
@@ -44,8 +55,196 @@ REGISTERED_PROPERTY_PATHS = (
 )
 
 
+class MODIMP_TextureMarkItem(bpy.types.PropertyGroup):
+    """One texture candidate row shown in the manual marking list."""
+
+    slot: bpy.props.StringProperty(name="Slot", default="")
+    hash_value: bpy.props.StringProperty(name="Hash", default="")
+    source_path: bpy.props.StringProperty(name="Source", default="", subtype="FILE_PATH")
+    filename: bpy.props.StringProperty(name="Filename", default="")
+    semantic: bpy.props.StringProperty(name="Semantic", default="")
+    semantic_index: bpy.props.IntProperty(name="Semantic Index", default=0, min=0)
+
+
+def _read_text_json(text_name: str) -> object | None:
+    text = bpy.data.texts.get(str(text_name or "").strip())
+    if text is None:
+        return None
+    try:
+        return json.loads(text.as_string())
+    except json.JSONDecodeError:
+        return None
+
+
+def _active_work_collection(scene: bpy.types.Scene) -> bpy.types.Collection | None:
+    for name in (scene.modimp_collection_name.strip(), scene.modimp_export_collection_name.strip()):
+        if not name:
+            continue
+        collection = bpy.data.collections.get(name)
+        if collection is not None:
+            return collection
+    return None
+
+
+def _draw_rows_for_scene(scene: bpy.types.Scene) -> list[dict[str, object]]:
+    collection = _active_work_collection(scene)
+    if collection is None:
+        return []
+    draw_text_name = str(collection.get(_DRAW_PASS_MAP_TEXT_PROP, "") or "")
+    payload = _read_text_json(draw_text_name)
+    if not isinstance(payload, dict):
+        return []
+    draws = payload.get("draws", [])
+    return [dict(item) for item in draws if isinstance(item, dict)]
+
+
+def _texture_region_key(draw: dict[str, object]) -> str:
+    raw_hash = str(draw.get("raw_ib_hash", "") or "").strip().lower()
+    index_count = int(draw.get("index_count", 0) or 0)
+    first_index = int(draw.get("first_index", 0) or 0)
+    if not raw_hash or index_count <= 0:
+        return ""
+    return f"{raw_hash}_{index_count}_{first_index}"
+
+
+def _texture_region_label(region_key: str) -> str:
+    parts = region_key.split("_")
+    if len(parts) != 3:
+        return region_key
+    return f"{parts[0]} count={parts[1]} first={parts[2]}"
+
+
+def _texture_mark_region_items(self, context):  # pylint: disable=unused-argument
+    seen: set[str] = set()
+    items = []
+    for draw in _draw_rows_for_scene(context.scene):
+        key = _texture_region_key(draw)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        items.append((key, _texture_region_label(key), "FrameAnalysis draw region"))
+    if not items:
+        return [("__none__", "No analyzed regions", "Run Analyze first")]
+    return items
+
+
+def _draw_score(draw: dict[str, object]) -> tuple[int, int, int, int]:
+    ps_hashes = draw.get("ps_resource_hashes", {})
+    if not isinstance(ps_hashes, dict):
+        ps_hashes = {}
+    texture_count = sum(1 for key in ps_hashes if str(key).startswith("ps-t"))
+    rt_count = int(draw.get("rt_count", 0) or 0)
+    index_count = int(draw.get("index_count", 0) or 0)
+    event_index = int(draw.get("event_index", 0) or 0)
+    return texture_count, rt_count, index_count, event_index
+
+
+def _texture_mark_draw_items(self, context):  # pylint: disable=unused-argument
+    scene = context.scene
+    region_key = str(scene.modimp_texture_mark_region or "")
+    rows = [draw for draw in _draw_rows_for_scene(scene) if _texture_region_key(draw) == region_key]
+    rows.sort(key=_draw_score, reverse=True)
+    items = []
+    for draw in rows:
+        event_index = int(draw.get("event_index", 0) or 0)
+        rt_count = int(draw.get("rt_count", 0) or 0)
+        ps_hash = str(draw.get("ps_hash", "") or "")
+        ps_hashes = draw.get("ps_resource_hashes", {})
+        texture_count = len(ps_hashes) if isinstance(ps_hashes, dict) else 0
+        label = f"{event_index:06d}  RT={rt_count}  textures={texture_count}"
+        if ps_hash:
+            label = f"{label}  ps={ps_hash[:8]}"
+        items.append((str(event_index), label, "Draw event from FrameAnalysis"))
+    if not items:
+        return [("__none__", "No texture draw candidates", "No draw rows for this region")]
+    return items
+
+
+def _draw_texture_candidates(scene: bpy.types.Scene) -> tuple[dict[str, dict[str, object]], dict[str, dict[str, object]]]:
+    collection = _active_work_collection(scene)
+    if collection is None:
+        return {}, {}
+    payload = _read_text_json(str(collection.get(_TEXTURE_MARKS_TEXT_PROP, "") or ""))
+    if not isinstance(payload, dict):
+        return {}, {}
+    region_key = str(scene.modimp_texture_mark_region or "")
+    draw_key = str(scene.modimp_texture_mark_draw or "")
+    candidates = payload.get("candidates", {})
+    marks = payload.get("marks", {})
+    if not isinstance(candidates, dict):
+        candidates = {}
+    if not isinstance(marks, dict):
+        marks = {}
+    region_candidates = candidates.get(region_key, {})
+    region_marks = marks.get(region_key, {})
+    if not isinstance(region_candidates, dict):
+        region_candidates = {}
+    if not isinstance(region_marks, dict):
+        region_marks = {}
+    draw_candidates = region_candidates.get(draw_key, {})
+    draw_marks = region_marks.get(draw_key, {})
+    if not isinstance(draw_candidates, dict):
+        draw_candidates = {}
+    if not isinstance(draw_marks, dict):
+        draw_marks = {}
+    return draw_candidates, draw_marks
+
+
+def _slot_sort_key(slot: str) -> int:
+    tail = str(slot).split("-t")[-1]
+    return int(tail) if tail.isdigit() else 999
+
+
+def sync_texture_mark_items(scene: bpy.types.Scene):
+    """Refresh the UIList rows from the active analyzed draw and mark cache."""
+    if not hasattr(scene, "modimp_texture_mark_items"):
+        return
+    draw_candidates, draw_marks = _draw_texture_candidates(scene)
+    scene.modimp_texture_mark_items.clear()
+    for slot, binding in sorted(draw_candidates.items(), key=lambda item: _slot_sort_key(item[0])):
+        item = scene.modimp_texture_mark_items.add()
+        item.slot = str(slot)
+        item.hash_value = str(binding.get("hash", "") or "")
+        item.source_path = str(binding.get("source_path", "") or "")
+        item.filename = str(item.source_path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1])
+        mark = draw_marks.get(slot, {})
+        if isinstance(mark, dict):
+            item.semantic = str(mark.get("semantic", "") or "")
+            item.semantic_index = int(mark.get("semantic_index", 0) or 0)
+    if scene.modimp_texture_mark_index >= len(scene.modimp_texture_mark_items):
+        scene.modimp_texture_mark_index = max(0, len(scene.modimp_texture_mark_items) - 1)
+
+
+def _update_texture_mark_draw(self, context):  # pylint: disable=unused-argument
+    sync_texture_mark_items(context.scene)
+
+
+def _update_texture_mark_region(self, context):  # pylint: disable=unused-argument
+    scene = context.scene
+    collection = _active_work_collection(scene)
+    if collection is None:
+        return
+    payload = _read_text_json(str(collection.get(_TEXTURE_MARKS_TEXT_PROP, "") or ""))
+    if not isinstance(payload, dict):
+        return
+    default_draws = payload.get("default_draws", {})
+    if not isinstance(default_draws, dict):
+        return
+    draw_key = str(default_draws.get(str(scene.modimp_texture_mark_region or ""), "") or "")
+    if not draw_key:
+        return
+    try:
+        scene.modimp_texture_mark_draw = draw_key
+    except TypeError:
+        sync_texture_mark_items(scene)
+
+
 def register_addon_properties():
     """Register the scene properties exposed by the add-on."""
+    try:
+        bpy.utils.register_class(MODIMP_TextureMarkItem)
+    except ValueError:
+        pass
     bpy.types.Scene.modimp_profile = bpy.props.EnumProperty(
         name="Profile",
         items=PROFILE_ITEMS,
@@ -77,6 +276,30 @@ def register_addon_properties():
         name="Show Export Advanced",
         default=False,
         description="Expand extra export settings",
+    )
+    bpy.types.Scene.modimp_ui_show_texture_marking = bpy.props.BoolProperty(
+        name="Show Texture Marking",
+        default=False,
+        description="Expand manual texture semantic marking tools",
+    )
+    bpy.types.Scene.modimp_texture_mark_region = bpy.props.EnumProperty(
+        name="Texture Region",
+        items=_texture_mark_region_items,
+        update=_update_texture_mark_region,
+        description="Choose which analyzed draw region to mark textures for",
+    )
+    bpy.types.Scene.modimp_texture_mark_draw = bpy.props.EnumProperty(
+        name="Texture Draw",
+        items=_texture_mark_draw_items,
+        update=_update_texture_mark_draw,
+        description="Choose which draw candidate supplies the texture list. Analyze defaults this to the g-buffer-like draw.",
+    )
+    bpy.types.Scene.modimp_texture_mark_items = bpy.props.CollectionProperty(type=MODIMP_TextureMarkItem)
+    bpy.types.Scene.modimp_texture_mark_index = bpy.props.IntProperty(
+        name="Texture Mark Index",
+        default=0,
+        min=0,
+        description="Active texture candidate row",
     )
     bpy.types.Scene.modimp_object_prefix = bpy.props.StringProperty(
         name="Object Prefix",
@@ -238,3 +461,7 @@ def unregister_addon_properties():
     for owner_type, property_name in reversed(REGISTERED_PROPERTY_PATHS):
         if hasattr(owner_type, property_name):
             delattr(owner_type, property_name)
+    try:
+        bpy.utils.unregister_class(MODIMP_TextureMarkItem)
+    except RuntimeError:
+        pass

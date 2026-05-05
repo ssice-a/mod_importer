@@ -20,6 +20,7 @@ from .io import (
     read_weight_pairs,
 )
 from .models import DetectedModelBundle, PackedHalf2x4, ResolvedImportBundle
+from .texture_converter import TextureConversionError, load_image_for_blender
 
 
 @dataclass(frozen=True)
@@ -172,6 +173,10 @@ def _texture_slots_json(resolved_bundle: ResolvedImportBundle) -> str:
     )
 
 
+def _texture_slots_json_from_payload(texture_slots: dict[str, dict[str, object]]) -> str:
+    return json.dumps(texture_slots, ensure_ascii=False)
+
+
 def _resolve_outline_param_buffer(resolved_bundle: ResolvedImportBundle) -> str | None:
     outline_hash = resolved_bundle.selected_slice.match_vs_outline_hash
     if not outline_hash:
@@ -193,12 +198,10 @@ def _bsdf_input(bsdf_node, *names: str):
 
 
 def _add_image_texture_node(nodes, source_path: str, label: str, *, color_space: str | None = None):
-    image = bpy.data.images.load(source_path, check_existing=True)
-    if color_space and hasattr(image, "colorspace_settings"):
-        try:
-            image.colorspace_settings.name = color_space
-        except TypeError:
-            pass
+    try:
+        image = load_image_for_blender(source_path, color_space=color_space)
+    except (FileNotFoundError, RuntimeError, TextureConversionError, OSError):
+        return None
     node = nodes.new(type="ShaderNodeTexImage")
     node.label = label
     node.image = image
@@ -206,9 +209,44 @@ def _add_image_texture_node(nodes, source_path: str, label: str, *, color_space:
 
 
 def _apply_material_from_texture_slots(imported_object: bpy.types.Object, resolved_bundle: ResolvedImportBundle):
-    texture_slots = resolved_bundle.selected_slice.texture_slots
+    texture_slots = {
+        slot: {
+            "hash": binding.hash_value,
+            "source_path": binding.source_path,
+            "extension": binding.extension,
+            "draw_index": binding.draw_index,
+            "ps_hash": binding.ps_hash or "",
+            "rt_count": binding.rt_count,
+        }
+        for slot, binding in sorted(resolved_bundle.selected_slice.texture_slots.items())
+    }
+    apply_material_from_texture_slot_payload(imported_object, texture_slots, clear_existing=False)
+
+
+def apply_material_from_texture_slot_payload(
+    imported_object: bpy.types.Object,
+    texture_slots: dict[str, dict[str, object]],
+    *,
+    clear_existing: bool = True,
+):
+    """Create/update a simple Blender material from semantic texture bindings."""
     if not texture_slots:
-        return
+        return False
+
+    def binding_for_semantic(semantic: str, fallback_slot: str):
+        for binding in texture_slots.values():
+            if isinstance(binding, dict) and str(binding.get("semantic", "") or "") == semantic:
+                return binding
+        fallback = texture_slots.get(fallback_slot)
+        return fallback if isinstance(fallback, dict) else None
+
+    base_binding = binding_for_semantic("base_color", "ps-t7")
+    normal_binding = binding_for_semantic("normal", "ps-t5")
+    if base_binding is None and normal_binding is None:
+        return False
+
+    if clear_existing:
+        imported_object.data.materials.clear()
 
     material_name = f"{imported_object.name}_Material"
     material = bpy.data.materials.new(material_name)
@@ -218,26 +256,31 @@ def _apply_material_from_texture_slots(imported_object: bpy.types.Object, resolv
     bsdf = nodes.get("Principled BSDF")
     if bsdf is None:
         imported_object.data.materials.append(material)
-        return
+        return True
 
-    base_binding = texture_slots.get("ps-t7")
     if base_binding is not None:
-        base_node = _add_image_texture_node(nodes, base_binding.source_path, "ps-t7 base color")
-        base_input = _bsdf_input(bsdf, "Base Color")
-        if base_input is not None:
-            links.new(base_node.outputs["Color"], base_input)
+        base_path = str(base_binding.get("source_path", "") or "")
+        if base_path:
+            base_slot = str(base_binding.get("slot", "") or "base color")
+            base_node = _add_image_texture_node(nodes, base_path, f"{base_slot} base color")
+            base_input = _bsdf_input(bsdf, "Base Color")
+            if base_node is not None and base_input is not None:
+                links.new(base_node.outputs["Color"], base_input)
 
-    normal_binding = texture_slots.get("ps-t5")
     if normal_binding is not None:
-        normal_node = _add_image_texture_node(nodes, normal_binding.source_path, "ps-t5 normal", color_space="Non-Color")
-        normal_map = nodes.new(type="ShaderNodeNormalMap")
-        normal_input = _bsdf_input(bsdf, "Normal")
-        if normal_input is not None:
-            links.new(normal_node.outputs["Color"], normal_map.inputs["Color"])
-            links.new(normal_map.outputs["Normal"], normal_input)
+        normal_path = str(normal_binding.get("source_path", "") or "")
+        if normal_path:
+            normal_slot = str(normal_binding.get("slot", "") or "normal")
+            normal_node = _add_image_texture_node(nodes, normal_path, f"{normal_slot} normal", color_space="Non-Color")
+            normal_input = _bsdf_input(bsdf, "Normal")
+            if normal_node is not None and normal_input is not None:
+                normal_map = nodes.new(type="ShaderNodeNormalMap")
+                links.new(normal_node.outputs["Color"], normal_map.inputs["Color"])
+                links.new(normal_map.outputs["Normal"], normal_input)
 
-    material["modimp_texture_slots"] = _texture_slots_json(resolved_bundle)
+    material["modimp_texture_slots"] = _texture_slots_json_from_payload(texture_slots)
     imported_object.data.materials.append(material)
+    return True
 
 
 def _assign_palette_groups(
