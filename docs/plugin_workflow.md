@@ -1,5 +1,7 @@
 # 插件流程
 
+[English](en/plugin_workflow.md) | 中文
+
 本文按用户实际操作顺序说明插件用法。
 
 ## 1. Analyze

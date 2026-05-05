@@ -1,5 +1,7 @@
 # NTMI Mod Importer
 
+[English](README.en.md) | 中文
+
 NTMI Mod Importer 是一个 Blender 插件，用于配合修改版 3DMigoto / NTMI fast path 工作流，从 FrameAnalysis 导入角色模型，在 Blender 中编辑后导出游戏可用的 Buffer 与可选 INI。
 
 当前插件只面向新的 NTMI 运行链路，不再生成旧的 BoneStore、PoseSlot、ShaderRegex、`ShaderOverride + checktextureoverride = ib` 方案。
@@ -43,4 +45,3 @@ NTMI Mod Importer 是一个 Blender 插件，用于配合修改版 3DMigoto / NT
 - 性能第一：不生成大范围 VS check，不生成旧 ShaderRegex fallback，不把可离线分析的事情放到运行时。
 - 复用第二：蒙皮逻辑调用 NTMI Core，插件不再为每个角色复制专属 HLSL。
 - 整洁第三：旧逻辑直接删除，不为兼容旧包保留独立路径。
-

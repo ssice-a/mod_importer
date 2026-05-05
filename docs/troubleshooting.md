@@ -1,5 +1,7 @@
 # 常见问题
 
+[English](en/troubleshooting.md) | 中文
+
 ## Analyze 找不到 draw slices
 
 检查：
@@ -112,4 +114,3 @@ global persist $swapkey_0456d530_up = 0
 - 迭代时尽量减少重型实时修改器。
 - 调试 Buffer 时优先用 `Buffers Only`。
 - 只有 Buffer 结果稳定后再导出 INI。
-

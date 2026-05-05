@@ -1,5 +1,7 @@
 # INI 语法
 
+[English](en/ini_syntax.md) | 中文
+
 本文记录当前插件生成的 NTMI fast-path INI 规则。
 
 旧的 `ShaderOverride + checktextureoverride = ib`、ShaderRegex、BoneStore、PoseSlot、角色专属 HLSL 复制方案已经废弃，不属于当前支持范围。
@@ -174,4 +176,3 @@ Blend local bone index -> Palette local slot -> RuntimeGlobalT0 global bone inde
 Runtime shapekey 是可选功能。
 
 静态 position 和 normal 总是导出 Blender 当前可见结果。如果某个 shapekey 在 Blender 中是 `0.7`，导出的静态网格已经包含 `0.7` 的结果。Runtime shapekey 数据只保存相对当前导出状态的增量，避免游戏初始画面重复叠加同一个 shapekey。
-

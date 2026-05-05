@@ -20,10 +20,12 @@ except ModuleNotFoundError:  # pragma: no cover - used for parser tests outside 
 if bpy is not None:
     import importlib
 
+    from . import i18n
     from .core import discovery, exporter, importer, io, profiles, texture_converter
 
     # Blender keeps Python submodules alive across add-on reloads. Reload core
     # modules first so operators/panels never hold stale function references.
+    i18n = importlib.reload(i18n)
     profiles = importlib.reload(profiles)
     io = importlib.reload(io)
     texture_converter = importlib.reload(texture_converter)

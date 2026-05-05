@@ -6,6 +6,7 @@ import json
 
 import bpy
 
+from .i18n import LANGUAGE_ITEMS
 from .core.profiles import PROFILE_ITEMS, YIHUAN_PROFILE
 
 
@@ -14,6 +15,7 @@ _TEXTURE_MARKS_TEXT_PROP = "modimp_texture_marks_text"
 
 
 REGISTERED_PROPERTY_PATHS = (
+    (bpy.types.Scene, "modimp_ui_language"),
     (bpy.types.Scene, "modimp_profile"),
     (bpy.types.Scene, "modimp_frame_dump_dir"),
     (bpy.types.Scene, "modimp_ib_hash"),
@@ -245,6 +247,12 @@ def register_addon_properties():
         bpy.utils.register_class(MODIMP_TextureMarkItem)
     except ValueError:
         pass
+    bpy.types.Scene.modimp_ui_language = bpy.props.EnumProperty(
+        name="UI Language",
+        items=LANGUAGE_ITEMS,
+        default="ZH",
+        description="Choose the add-on UI language",
+    )
     bpy.types.Scene.modimp_profile = bpy.props.EnumProperty(
         name="Profile",
         items=PROFILE_ITEMS,
