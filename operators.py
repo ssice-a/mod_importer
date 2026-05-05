@@ -385,17 +385,22 @@ def _apply_texture_marks_to_object(obj: bpy.types.Object, texture_payload: dict[
     region_hash, index_count, first_index = _object_region_identity(obj)
     region = _region_key(region_hash, index_count, first_index) if region_hash else ""
     if not region:
+        print(f"[ModImporter][Texture] {obj.name}: no region identity; skip exact texture apply.")
         return False
     slots = _texture_slots_from_mark_payload(texture_payload, region)
     if not slots:
+        print(f"[ModImporter][Texture] {obj.name}: no marked slots for exact region {region}.")
         return False
+    print(f"[ModImporter][Texture] {obj.name}: exact region {region} slots={list(sorted(slots))}")
     obj[_TEXTURE_SLOTS_PROP] = json.dumps(slots, ensure_ascii=False)
     return bool(apply_material_from_texture_slot_payload(obj, slots, clear_existing=True))
 
 
 def _apply_texture_slots_to_object(obj: bpy.types.Object, slots: dict[str, dict[str, object]]) -> bool:
     if obj.type != "MESH" or not slots:
+        print(f"[ModImporter][Texture] {obj.name}: fallback apply skipped; type={obj.type}, slots={len(slots)}")
         return False
+    print(f"[ModImporter][Texture] {obj.name}: fallback apply current UI region slots={list(sorted(slots))}")
     obj[_TEXTURE_SLOTS_PROP] = json.dumps(slots, ensure_ascii=False)
     return bool(apply_material_from_texture_slot_payload(obj, slots, clear_existing=True))
 
@@ -433,12 +438,18 @@ def _apply_current_texture_region_to_selected_or_collection(
 ) -> tuple[int, int]:
     region = str(context.scene.modimp_texture_mark_region or "").strip()
     if not region or region == "__none__":
+        print("[ModImporter][Texture] fallback apply skipped: no current texture region selected.")
         return 0, 0
     slots = _texture_slots_from_mark_payload(texture_payload, region)
     if not slots:
+        print(f"[ModImporter][Texture] fallback apply skipped: current region {region} has no marked slots.")
         return 0, 0
 
     objects = _selected_mesh_objects(context)
+    print(
+        f"[ModImporter][Texture] fallback region={region}, selected_meshes={len(objects)}, "
+        f"slots={list(sorted(slots))}"
+    )
     if not objects:
         visited: set[str] = set()
         for child in _iter_collection_tree(collection):
@@ -447,6 +458,7 @@ def _apply_current_texture_region_to_selected_or_collection(
                     continue
                 visited.add(obj.name)
                 objects.append(obj)
+        print(f"[ModImporter][Texture] fallback collected {len(objects)} mesh object(s) from {collection.name}.")
 
     matched = 0
     applied = 0

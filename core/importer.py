@@ -190,21 +190,64 @@ def _resolve_outline_param_buffer(resolved_bundle: ResolvedImportBundle) -> str 
     return None
 
 
+def _principled_bsdf_node(nodes):
+    node = nodes.get("Principled BSDF")
+    if node is not None:
+        return node
+    for candidate in nodes:
+        if getattr(candidate, "bl_idname", "") == "ShaderNodeBsdfPrincipled":
+            return candidate
+    return None
+
+
+def _ensure_principled_bsdf_node(material: bpy.types.Material, *, reset: bool):
+    nodes = material.node_tree.nodes
+    links = material.node_tree.links
+    if reset:
+        nodes.clear()
+
+    bsdf = _principled_bsdf_node(nodes)
+    if bsdf is None:
+        bsdf = nodes.new(type="ShaderNodeBsdfPrincipled")
+        bsdf.location = (0, 0)
+
+    output = None
+    for candidate in nodes:
+        if getattr(candidate, "bl_idname", "") == "ShaderNodeOutputMaterial":
+            output = candidate
+            break
+    if output is None:
+        output = nodes.new(type="ShaderNodeOutputMaterial")
+        output.location = (320, 0)
+
+    if "BSDF" in bsdf.outputs and "Surface" in output.inputs:
+        has_link = any(link.from_node == bsdf and link.to_node == output for link in links)
+        if not has_link:
+            links.new(bsdf.outputs["BSDF"], output.inputs["Surface"])
+    return bsdf
+
+
 def _bsdf_input(bsdf_node, *names: str):
     for name in names:
         if name in bsdf_node.inputs:
             return bsdf_node.inputs[name]
+    for socket in bsdf_node.inputs:
+        identifier = str(getattr(socket, "identifier", "") or "")
+        if identifier in names:
+            return socket
     return None
 
 
 def _add_image_texture_node(nodes, source_path: str, label: str, *, color_space: str | None = None):
     try:
         image = load_image_for_blender(source_path, color_space=color_space)
-    except (FileNotFoundError, RuntimeError, TextureConversionError, OSError):
+    except (FileNotFoundError, RuntimeError, TextureConversionError, OSError) as exc:
+        print(f"[ModImporter][Texture] failed to load image for {label}: {source_path} ({exc})")
         return None
     node = nodes.new(type="ShaderNodeTexImage")
     node.label = label
     node.image = image
+    print(f"[ModImporter][Texture] loaded image node {label}: {image.filepath}")
     return node
 
 
@@ -231,6 +274,7 @@ def apply_material_from_texture_slot_payload(
 ):
     """Create/update a simple Blender material from semantic texture bindings."""
     if not texture_slots:
+        print(f"[ModImporter][Texture] {imported_object.name}: no texture slots to apply.")
         return False
 
     def binding_for_semantic(semantic: str, fallback_slot: str):
@@ -242,30 +286,50 @@ def apply_material_from_texture_slot_payload(
 
     base_binding = binding_for_semantic("base_color", "ps-t7")
     normal_binding = binding_for_semantic("normal", "ps-t5")
+    semantic_summary = {
+        slot: str(binding.get("semantic", "") or "")
+        for slot, binding in sorted(texture_slots.items())
+        if isinstance(binding, dict)
+    }
+    print(
+        f"[ModImporter][Texture] {imported_object.name}: applying slots={list(sorted(texture_slots))}, "
+        f"semantics={semantic_summary}, has_base={base_binding is not None}, has_normal={normal_binding is not None}"
+    )
     if base_binding is None and normal_binding is None:
+        print(f"[ModImporter][Texture] {imported_object.name}: skipped material, no base_color/ps-t7 or normal/ps-t5.")
         return False
 
     if clear_existing:
         imported_object.data.materials.clear()
 
     material_name = f"{imported_object.name}_Material"
-    material = bpy.data.materials.new(material_name)
+    material = bpy.data.materials.get(material_name)
+    if material is None:
+        material = bpy.data.materials.new(material_name)
     material.use_nodes = True
     nodes = material.node_tree.nodes
     links = material.node_tree.links
-    bsdf = nodes.get("Principled BSDF")
+    bsdf = _ensure_principled_bsdf_node(material, reset=clear_existing)
     if bsdf is None:
+        print(f"[ModImporter][Texture] {imported_object.name}: no Principled BSDF node found; material created only.")
         imported_object.data.materials.append(material)
         return True
+    nodes = material.node_tree.nodes
+    links = material.node_tree.links
 
     if base_binding is not None:
         base_path = str(base_binding.get("source_path", "") or "")
-        if base_path:
+        if not base_path:
+            print(f"[ModImporter][Texture] {imported_object.name}: base color binding has no source_path: {base_binding}")
+        else:
             base_slot = str(base_binding.get("slot", "") or "base color")
             base_node = _add_image_texture_node(nodes, base_path, f"{base_slot} base color")
-            base_input = _bsdf_input(bsdf, "Base Color")
+            base_input = _bsdf_input(bsdf, "Base Color", "BaseColor")
             if base_node is not None and base_input is not None:
                 links.new(base_node.outputs["Color"], base_input)
+                print(f"[ModImporter][Texture] {imported_object.name}: linked base color from {base_path}")
+            else:
+                print(f"[ModImporter][Texture] {imported_object.name}: base color node/input missing for {base_path}")
 
     if normal_binding is not None:
         normal_path = str(normal_binding.get("source_path", "") or "")
@@ -277,6 +341,9 @@ def apply_material_from_texture_slot_payload(
                 normal_map = nodes.new(type="ShaderNodeNormalMap")
                 links.new(normal_node.outputs["Color"], normal_map.inputs["Color"])
                 links.new(normal_map.outputs["Normal"], normal_input)
+                print(f"[ModImporter][Texture] {imported_object.name}: linked normal from {normal_path}")
+            else:
+                print(f"[ModImporter][Texture] {imported_object.name}: normal node/input missing for {normal_path}")
 
     material["modimp_texture_slots"] = _texture_slots_json_from_payload(texture_slots)
     imported_object.data.materials.append(material)

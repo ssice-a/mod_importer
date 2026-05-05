@@ -5,7 +5,7 @@ from __future__ import annotations
 bl_info = {
     "name": "Mod Importer",
     "author": "OpenAI Codex",
-    "version": (0, 6, 0),
+    "version": (0, 6, 1),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Mod Importer",
     "description": "Import and export NTMI fast-path model buffers and optional INI files.",
@@ -18,7 +18,24 @@ except ModuleNotFoundError:  # pragma: no cover - used for parser tests outside 
     bpy = None
 
 if bpy is not None:
+    import importlib
+
+    from .core import discovery, exporter, importer, io, profiles, texture_converter
+
+    # Blender keeps Python submodules alive across add-on reloads. Reload core
+    # modules first so operators/panels never hold stale function references.
+    profiles = importlib.reload(profiles)
+    io = importlib.reload(io)
+    texture_converter = importlib.reload(texture_converter)
+    discovery = importlib.reload(discovery)
+    exporter = importlib.reload(exporter)
+    importer = importlib.reload(importer)
+
     from . import operators, panel, properties
+
+    properties = importlib.reload(properties)
+    panel = importlib.reload(panel)
+    operators = importlib.reload(operators)
 
     REGISTERED_CLASSES = (
         operators.MODIMP_OT_resolve_from_ib_hash,

@@ -87,7 +87,13 @@ def find_texconv() -> Path | None:
     return None
 
 
-def _run_texconv(args: list[str]) -> subprocess.CompletedProcess[str]:
+def _decode_process_output(payload: bytes | None) -> str:
+    if not payload:
+        return ""
+    return payload.decode("utf-8", errors="replace").strip()
+
+
+def _run_texconv(args: list[str]) -> subprocess.CompletedProcess[bytes]:
     texconv = find_texconv()
     if texconv is None:
         raise TextureConversionUnavailable(
@@ -99,10 +105,9 @@ def _run_texconv(args: list[str]) -> subprocess.CompletedProcess[str]:
             [str(texconv), "-nologo", *args],
             check=True,
             capture_output=True,
-            text=True,
         )
     except subprocess.CalledProcessError as exc:
-        details = (exc.stderr or exc.stdout or "").strip()
+        details = _decode_process_output(exc.stderr) or _decode_process_output(exc.stdout)
         raise TextureConversionError(f"texconv failed: {details}") from exc
 
 
