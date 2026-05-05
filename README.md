@@ -11,7 +11,9 @@ NTMI Mod Importer 是一个 Blender 插件，用于配合修改版 3DMigoto / NT
 - Windows。
 - Blender 4.0 或更高版本。当前开发环境使用 Blender 5.0。
 - 支持 NTMI fast TextureOverride 与 Collector 语法的修改版 3DMigoto。
-- 游戏环境中已安装 NTMI Core，例如 `Core/NTMI`。
+- [NTMI-PACKAGE v0.3.0](https://github.com/ssice-a/NTMI-PACKAGE/releases/tag/NTMI-PACKAGE-v0.3.0)。
+- [XXMI-Libs-Package v0.3.0](https://github.com/ssice-a/XXMI-Libs-Package/releases/tag/v0.3.0)。
+- 安装运行时包时，请分别下载上述 release，解压后把包内文件复制到你的 3DMigoto 文件夹下，并覆盖对应文件。
 - 目标角色与目标 IB 的 FrameAnalysis dump。
 - `texconv.exe` 用于 DDS 预览和转换。插件默认会查找 `assets/tools/texconv/texconv.exe`。
 
@@ -45,3 +47,4 @@ NTMI Mod Importer 是一个 Blender 插件，用于配合修改版 3DMigoto / NT
 - 性能第一：不生成大范围 VS check，不生成旧 ShaderRegex fallback，不把可离线分析的事情放到运行时。
 - 复用第二：蒙皮逻辑调用 NTMI Core，插件不再为每个角色复制专属 HLSL。
 - 整洁第三：旧逻辑直接删除，不为兼容旧包保留独立路径。
+

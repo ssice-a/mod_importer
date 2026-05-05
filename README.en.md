@@ -11,7 +11,9 @@ The add-on targets the new NTMI runtime pipeline. It no longer generates the old
 - Windows.
 - Blender 4.0 or newer. The current development environment uses Blender 5.0.
 - A modified 3DMigoto build that supports NTMI fast TextureOverride and Collector syntax.
-- NTMI Core installed in the game setup, for example `Core/NTMI`.
+- [NTMI-PACKAGE v0.3.0](https://github.com/ssice-a/NTMI-PACKAGE/releases/tag/NTMI-PACKAGE-v0.3.0).
+- [XXMI-Libs-Package v0.3.0](https://github.com/ssice-a/XXMI-Libs-Package/releases/tag/v0.3.0).
+- To install the runtime packages, download both releases, extract them, then copy their contents into your 3DMigoto folder and overwrite the matching files.
 - FrameAnalysis dumps for the target character and target IB.
 - `texconv.exe` for DDS preview and conversion. The add-on looks for `assets/tools/texconv/texconv.exe` by default.
 
