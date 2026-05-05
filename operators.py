@@ -1243,7 +1243,14 @@ def _build_bone_merge_map(summary: dict[str, object], detected_model) -> dict[st
     collector_rows = _collector_dispatch_rows(summary, detected_model)
     # Keep every matched producer dispatch. Some frames reuse the same collect key
     # across multiple segments, and collapsing them would silently drop valid bones.
-    collector_build_rows = sorted(collector_rows, key=lambda item: int(item["event_index"]))
+    collector_build_rows = sorted(
+        collector_rows,
+        key=lambda item: (
+            int(item.get("start_vertex") or 0),
+            int(item.get("vertex_count") or 0),
+            int(item["event_index"]),
+        ),
+    )
     for dispatch in collector_build_rows:
         dispatch_index = int(dispatch["event_index"])
         bone_count = _bone_count_from_t0_path(str(dispatch.get("t0_buf_path", "")))
